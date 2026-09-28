@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs/promises";
+import { dbOps } from "../config/db-sqlite.js";
 import { downloadTracker } from "./weeklyFlow/weeklyFlowDownloadTracker.js";
 import { getDownloadClient } from "./download/downloadClientSettings.js";
 import { logger, safeLogDiagnostic } from "./logger.js";
@@ -136,10 +137,12 @@ async function handleDeemixSearch(payload, helpers) {
 
   // Availability is provider-specific evidence the shared engine never sees.
   const availableResults = aggregated.filter((result) => result?.readable !== false);
+  const settings = dbOps.getSettings();
   const evaluation = await buildSourceCandidates({
     source: "deemix",
     results: availableResults,
     request: resolvedTrack,
+    settings,
   });
   if (evaluation.decision === "error") {
     return helpers.failOrTryNextSource(payload, job, safeLogDiagnostic(evaluation.error?.message || "track matcher unavailable"), {

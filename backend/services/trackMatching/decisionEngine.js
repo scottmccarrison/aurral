@@ -162,6 +162,7 @@ export async function evaluateTrackCandidates({
   candidates = [],
   options = {},
   providerEvidence = null,
+  settings = null,
 } = {}) {
   const trackRequest = request || buildTrackRequest(context);
   if (!trackRequest.trackName) {
@@ -169,6 +170,13 @@ export async function evaluateTrackCandidates({
   }
   const timeoutMs = options.timeoutMs || DEFAULT_MATCH_TIMEOUT_MS;
   const capabilities = getCapabilities(source);
+
+  // Merge matching settings from settings.matching into thresholds
+  const matchingSettings = settings?.matching || {};
+  const mergedThresholds = {
+    ...DEFAULT_MATCH_THRESHOLDS,
+    ...matchingSettings,
+  };
 
   const normalized = normalizeSourceCandidates(source, candidates, capabilities, trackRequest);
   const readProviderEvidence = (candidate, index) =>
@@ -187,6 +195,7 @@ export async function evaluateTrackCandidates({
       candidate,
       source,
       providerEvidence: evidence,
+      thresholds: mergedThresholds,
       phase: "pre",
       allowNoisyCandidates: options.allowNoisyCandidates === true,
     });
@@ -268,7 +277,9 @@ export async function evaluateTrackCandidates({
     };
   }
 
-  const thresholds = matcherOutcome.result?.thresholds || DEFAULT_MATCH_THRESHOLDS;
+  // Merge matcher thresholds with settings-based thresholds
+  const matcherThresholds = matcherOutcome.result?.thresholds || DEFAULT_MATCH_THRESHOLDS;
+  const finalThresholds = { ...matcherThresholds, ...mergedThresholds };
   const matchByIndex = new Map(
     (matcherOutcome.result?.matches || []).map((match) => [match.candidateIndex, match]),
   );
@@ -289,7 +300,7 @@ export async function evaluateTrackCandidates({
       source,
       providerEvidence: evidence,
       match,
-      thresholds,
+      thresholds: finalThresholds,
       phase: "pre",
       allowNoisyCandidates: options.allowNoisyCandidates === true,
     });

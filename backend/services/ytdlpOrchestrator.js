@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs/promises";
+import { dbOps } from "../config/db-sqlite.js";
 import { downloadTracker } from "./weeklyFlow/weeklyFlowDownloadTracker.js";
 import { getDownloadClient } from "./download/downloadClientSettings.js";
 import { logger } from "./logger.js";
@@ -94,10 +95,12 @@ async function handleYtdlpSearch(payload, helpers) {
   const downloadableResults = aggregated.filter(
     (result) => !isYtdlpLiveResult(result),
   );
+  const settings = dbOps.getSettings();
   const evaluation = await buildSourceCandidates({
     source: "ytdlp",
     results: downloadableResults,
     request: resolvedTrack,
+    settings,
   });
   if (evaluation.decision === "error") {
     return helpers.failOrTryNextSource(payload, job, MATCHER_UNAVAILABLE_MESSAGE, {

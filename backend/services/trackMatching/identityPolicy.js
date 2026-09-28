@@ -19,6 +19,11 @@ export const DEFAULT_MATCH_THRESHOLDS = Object.freeze({
   strongRecThresh: 0.04,
   mediumRecThresh: 0.25,
   recGapThresh: 0.25,
+  // Configurable review behavior (merged from settings.matching)
+  autoApproveDistance: 0.10,
+  autoDenyDistance: 0.50,
+  reviewTimeoutHours: 48,
+  reviewAction: "hold",  // "hold", "auto-deny", "retry-next-candidate"
 });
 
 const DURATION_BASE_TOLERANCE_MS = 25000;
@@ -231,7 +236,7 @@ function baseOutput({ request, candidate, match, evidence, thresholds, phase }) 
   };
 }
 
-function evaluatePreDownload({ source, evidence, base }) {
+function evaluatePreDownload({ source, evidence, base, thresholds = DEFAULT_MATCH_THRESHOLDS }) {
   if (evidence.identifier.match) {
     return {
       ...base,
@@ -242,15 +247,41 @@ function evaluatePreDownload({ source, evidence, base }) {
     };
   }
 
-  let decision = base.recommendation === "strong"
-    ? "accept"
-    : base.recommendation === "medium"
-      ? "verify"
-      : "review";
+  // Use configurable thresholds for decision logic
+  const distance = base.distance;
+  const autoApprove = thresholds.autoApproveDistance ?? DEFAULT_MATCH_THRESHOLDS.autoApproveDistance;
+  const autoDeny = thresholds.autoDenyDistance ?? DEFAULT_MATCH_THRESHOLDS.autoDenyDistance;
+  const reviewAction = thresholds.reviewAction ?? DEFAULT_MATCH_THRESHOLDS.reviewAction;
+
+  let decision;
   const reasons = [...base.reasons];
-  if (base.recommendation === "strong") reasons.push("strong metadata match");
-  if (base.recommendation === "medium") reasons.push("moderate metadata match, post-download verification required");
-  if (base.recommendation === "low") reasons.push("weak metadata evidence");
+
+  if (distance != null && distance <= autoApprove) {
+    decision = "accept";
+    reasons.push(`distance ${distance} within auto-approve threshold (${autoApprove})`);
+  } else if (distance != null && distance > autoDeny) {
+    // Auto-deny: distance too high, don't even hold for review
+    if (reviewAction === "auto-deny") {
+      decision = "reject";
+      reasons.push(`distance ${distance} exceeds auto-deny threshold (${autoDeny}), auto-deny enabled`);
+    } else if (reviewAction === "retry-next-candidate") {
+      decision = "reject";
+      reasons.push(`distance ${distance} exceeds auto-deny threshold (${autoDeny}), retry-next-candidate enabled`);
+    } else {
+      decision = "review";
+      reasons.push(`distance ${distance} exceeds auto-deny threshold (${autoDeny}), held for review`);
+    }
+  } else if (base.recommendation === "strong") {
+    decision = "accept";
+    reasons.push("strong metadata match");
+  } else if (base.recommendation === "medium") {
+    decision = "verify";
+    reasons.push("moderate metadata match, post-download verification required");
+  } else {
+    // Default to review for low recommendation
+    decision = "review";
+    reasons.push("weak metadata evidence");
+  }
 
   if (
     getCapabilities(source).structuredArtist &&
@@ -350,7 +381,7 @@ export function evaluateTrackIdentity({
   const base = baseOutput({ request, candidate, match, evidence: hard, thresholds, phase });
   const evaluated = phase === "post"
     ? evaluatePostDownload({ base, evidence: hard })
-    : evaluatePreDownload({ source, evidence: hard, base });
+    : evaluatePreDownload({ source, evidence: hard, base, thresholds });
   return {
     ...hard,
     ...evaluated,

@@ -176,5 +176,12 @@ export const defaultData = {
       recommendedNews: false,
       discoveries: true,
     },
+    matching: {
+      // Pre-download thresholds
+      autoApproveDistance: 0.10,    // Below this distance = auto-approve (skip review)
+      autoDenyDistance: 0.50,       // Above this distance = auto-deny (don't hold for review)
+      reviewTimeoutHours: 48,       // Auto-deny reviews after this many hours
+      reviewAction: "hold",         // "hold" (current), "auto-deny", or "retry-next-candidate"
+    },
   },
 };

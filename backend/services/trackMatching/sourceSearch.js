@@ -21,6 +21,7 @@ export async function buildSourceCandidates({
   request,
   context,
   options = {},
+  settings = null,
 } = {}) {
   const trackRequest = request || buildTrackRequest(context);
   const rawResults = results ?? candidates ?? [];
@@ -32,6 +33,7 @@ export async function buildSourceCandidates({
       candidates: built.candidates,
       options,
       providerEvidence: built.providerEvidence,
+      settings,
     });
   }
   return evaluateTrackCandidates({
@@ -39,6 +41,7 @@ export async function buildSourceCandidates({
     source,
     candidates: rawResults,
     options,
+    settings,
   });
 }
 
