@@ -1,6 +1,6 @@
 import path from "path";
 import fs from "fs/promises";
-import { dbOps } from "../config/db-sqlite.js";
+import { dbOps } from "../db/helpers/index.js";
 import { downloadTracker } from "./weeklyFlow/weeklyFlowDownloadTracker.js";
 import { getDownloadClient } from "./download/downloadClientSettings.js";
 import { logger } from "./logger.js";

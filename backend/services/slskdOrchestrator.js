@@ -1,6 +1,7 @@
 import path from "path";
 import fs from "fs/promises";
-import { db, dbOps } from "../config/db-sqlite.js";
+import { db } from "../config/db-sqlite.js";
+import { dbOps } from "../db/helpers/index.js";
 import { getDownloadClient } from "./download/downloadClientSettings.js";
 import { logger } from "./logger.js";
 import { enqueuePipelineJob, listHonkerJobs } from "./honkerDb.js";
