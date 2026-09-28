@@ -299,10 +299,18 @@ function evaluatePostDownload({ base, evidence }) {
   } else if (base.tagsMatchStrongly && base.shapeAgrees) {
     decision = "VERIFIED";
   } else if (base.tagsMatchStrongly) {
-    decision = "AMBIGUOUS";
-    reason = !evidence.duration.withinValidationWindow
-      ? `duration mismatch: expected ${evidence.duration.expectedMs}ms, actual ${evidence.duration.actualMs}ms`
-      : `track number mismatch: expected ${evidence.trackNumber.expected}, actual ${evidence.trackNumber.actual}`;
+    // Strong tag match with shape disagreement. If the only issue is track
+    // number mismatch (duration is within tolerance), treat as verified —
+    // this is typically a deluxe/standard edition difference, not a wrong track.
+    if (evidence.duration.withinValidationWindow && evidence.trackNumber.mismatch) {
+      decision = "VERIFIED";
+      reason = null;
+    } else {
+      decision = "AMBIGUOUS";
+      reason = !evidence.duration.withinValidationWindow
+        ? `duration mismatch: expected ${evidence.duration.expectedMs}ms, actual ${evidence.duration.actualMs}ms`
+        : `track number mismatch: expected ${evidence.trackNumber.expected}, actual ${evidence.trackNumber.actual}`;
+    }
   } else if (base.recommendation === "medium" && base.shapeAgrees) {
     decision = "AMBIGUOUS";
     reason = `moderate identity match (distance ${base.distance})`;
