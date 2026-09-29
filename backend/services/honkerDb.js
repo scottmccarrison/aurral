@@ -115,6 +115,12 @@ export const SCHEDULED_SYSTEM_TASKS = [
     payload: { kind: "aurral-monitoring-reconcile" },
   },
   {
+    name: "sabnzbd-queue-health",
+    queue: "system-task-maintenance",
+    schedule: "@every 5m",
+    payload: { kind: "sabnzbd-queue-health" },
+  },
+  {
     name: "playlist-mbid-enrichment-sweep",
     queue: "playlist-mbid-enrichment",
     schedule: "@every 6h",

@@ -122,6 +122,11 @@ export async function processSystemTask(payload = {}, job = null) {
       await refreshLibraryNews();
       return;
     }
+    case "sabnzbd-queue-health": {
+      const { maintainSabnzbdQueueHealth } = await import("./sabnzbdQueueHealth.js");
+      const result = await maintainSabnzbdQueueHealth();
+      return result;
+    }
     case "playlist-startup-migration": {
       const [
         migrationModule,

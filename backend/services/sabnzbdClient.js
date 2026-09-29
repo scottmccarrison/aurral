@@ -210,6 +210,37 @@ export class SabnzbdClient {
     return result?.status === true;
   }
 
+  async getQueue() {
+    const result = await this.api("queue");
+    return result?.queue || { slots: [] };
+  }
+
+  async getHistory(limit = 100) {
+    const result = await this.api("history", { limit });
+    return result?.history || { slots: [] };
+  }
+
+  async resumeQueueItem(nzoId) {
+    const id = String(nzoId || "").trim();
+    if (!id) return false;
+    const result = await this.api("queue", { name: "resume", value: id });
+    return result?.status === true;
+  }
+
+  async resumeQueue() {
+    const result = await this.api("queue", { name: "resume", value: "" });
+    return result?.status === true;
+  }
+
+  async getDiskSpace() {
+    const result = await this.api("queue");
+    const queue = result?.queue || {};
+    return {
+      totalBytes: queue.diskspacetotal2 || queue.diskspacetotal1 || 0,
+      freeBytes: queue.diskspace2 || queue.diskspace1 || 0,
+    };
+  }
+
   async getDownloadDirectories() {
     const result = await this.api("get_config", { section: "misc" }).catch(() => null);
     const entries = result?.config?.misc || [];

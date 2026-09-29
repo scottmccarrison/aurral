@@ -90,6 +90,11 @@ export const defaultData = {
         category: "aurral",
         priority: 20,
         addPaused: false,
+        // Queue health manager settings
+        healthCheckIntervalMinutes: 5,
+        autoResumeAfterSpaceFreed: true,
+        deduplicateQueue: true,
+        cleanupCompletedAfterMinutes: 30,
       },
       ytdlp: {
         enabled: true,
