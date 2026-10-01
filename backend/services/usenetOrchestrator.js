@@ -33,6 +33,7 @@ import {
 } from "./pipelineHelpers.js";
 import { getQualityProfile } from "./qualityProfileService.js";
 import { orderAdvertisedQualityCandidates } from "./qualityProfileModel.js";
+import { getReleaseKeys, markActive } from "./downloadDedupService.js";
 
 const MIN_USENET_CANDIDATES = 2;
 const MAX_DOWNLOAD_CANDIDATES = 5;
@@ -169,6 +170,10 @@ async function handleUsenetSearch(payload, helpers) {
   if (!job) return null;
   if (job.status === "failed" || job.status === "done") return null;
   downloadTracker.setDownloading(job.id);
+  const claim = markActive(getReleaseKeys(payload), payload.source || "usenet", job.id);
+  if (!claim.claimed) {
+    return helpers.deferOrTryNextSource(payload, job, claim.reason);
+  }
   downloadTracker.updateDownloadMetadata(job.id, {
     downloadSource: "usenet",
   });

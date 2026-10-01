@@ -64,6 +64,36 @@ function normalizePlaylistWorkerSettings(raw) {
   };
 }
 
+function normalizeSourceSettings(raw) {
+  const sources = raw && typeof raw === "object" ? raw : {};
+  const parsedHours = Number(sources.failureMemoryHours);
+  const failureMemoryHours =
+    Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+  const parsedRetries = Number(sources.maxRetriesPerSource);
+  const maxRetriesPerSource =
+    Number.isFinite(parsedRetries) && parsedRetries >= 1
+      ? Math.floor(parsedRetries)
+      : 3;
+  // Never inject a default order: an empty list keeps pure priority sorting.
+  const preferredOrder = Array.isArray(sources.preferredOrder)
+    ? [
+        ...new Set(
+          sources.preferredOrder
+            .map((entry) => String(entry || "").trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  // Preserve unknown sources.* keys on round-trip (intentionally diverges from whitelist normalizers)
+  return {
+    ...sources,
+    deduplication: sources.deduplication !== false,
+    failureMemoryHours,
+    maxRetriesPerSource,
+    preferredOrder,
+  };
+}
+
 function getOrCreateEncryptionKey() {
   const row = getSettingStmt.get("_encryptionKey");
   if (row?.value) {
@@ -170,6 +200,7 @@ export const dbOps = {
     const playlistArtwork = normalizePlaylistArtworkSettings(
       readStoredSettingJson("playlistArtwork"),
     );
+    const sources = normalizeSourceSettings(readStoredSettingJson("sources"));
     const inbox = dbHelpers.parseJSON(getSettingStmt.get("inbox")?.value) || {};
     const blocklist = dbHelpers.parseJSON(
       getSettingStmt.get("blocklist")?.value
@@ -212,6 +243,7 @@ export const dbOps = {
       },
       playlistWorker,
       playlistArtwork,
+      sources,
       inbox: {
         enabled: inbox.enabled !== false,
         releases: inbox.releases !== false,
@@ -378,6 +410,12 @@ export const dbOps = {
           dbHelpers.stringifyJSON(
             normalizePlaylistArtworkSettings(settings.playlistArtwork),
           ),
+        );
+      }
+      if (settings.sources !== undefined) {
+        upsertSettingStmt.run(
+          "sources",
+          dbHelpers.stringifyJSON(normalizeSourceSettings(settings.sources)),
         );
       }
       if (settings.blocklist !== undefined) {

@@ -48,6 +48,7 @@ import {
   isFlowOwnerProcess,
   requestFlowOwner,
 } from "../../../services/weeklyFlow/weeklyFlowOwnerClient.js";
+import { getStats } from "../../../services/downloadDedupService.js";
 import {
   createManualMissingSearch,
   consumeManualMissingSelection,
@@ -109,6 +110,21 @@ async function runQualityChecksLocally(playlistIds) {
 export function registerJobs(router) {
   router.get("/status", noCache, (req, res) => {
     res.json(getWeeklyFlowStatusSnapshot({ user: req.user }));
+  });
+
+  router.get("/dedup-stats", noCache, async (_req, res) => {
+    try {
+      // The dedup registries live in the isolated flow worker process.
+      const stats = isFlowOwnerProcess()
+        ? getStats()
+        : await requestFlowOwner("getDedupStats", [], { timeoutMs: 10_000 });
+      res.json(stats);
+    } catch (error) {
+      res.status(503).json({
+        error: "Dedup stats are unavailable",
+        message: safeLogDiagnostic(error) || "The flow worker did not respond",
+      });
+    }
   });
 
   router.get("/jobs/:flowId", noCache, async (req, res) => {

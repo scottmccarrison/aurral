@@ -35,6 +35,12 @@ import {
   isAnyDownloadSourceConfigured,
 } from "./downloadSourceService.js";
 import {
+  getReleaseKeys,
+  markActive,
+  recordSourceFailure,
+  shouldAttemptAny,
+} from "./downloadDedupService.js";
+import {
   buildResolvedPlaylistTrack as buildResolvedTrack,
   commitImportToPlaylistLibrary,
   joinUnderRoot,
@@ -81,6 +87,7 @@ const MIN_SEARCH_CANDIDATES = 3;
 const MAX_DOWNLOAD_CANDIDATES = 7;
 const MAX_TRANSFER_RETRIES_PER_CANDIDATE = 1;
 const POLL_DELAY_SECONDS = 3;
+const DEDUP_DEFER_SECONDS = 30;
 export const SLSKD_NOT_CONFIGURED_MESSAGE =
   "slskd is not configured. Enable slskd and add its Server URL in Settings > Download clients to enable Soulseek downloads for flows and playlists.";
 
@@ -365,7 +372,12 @@ export function buildNextSourcePayload(payload, failedSource = null, reason = nu
       });
     }
   }
-  const next = sources.find((source) => !tried.has(source.id));
+  const releaseKeys = getReleaseKeys(payload);
+  const next = sources.find(
+    (source) =>
+      !tried.has(source.id) &&
+      shouldAttemptAny(releaseKeys, source.id, { jobId: payload?.jobId }).allowed,
+  );
   if (!next) return null;
   return {
     ...payload,
@@ -406,6 +418,7 @@ function summarizeSourceErrors(payload, message) {
 }
 
 async function failOrTryNextSource(payload, job, message, logDetails = {}) {
+  recordSourceFailure(payload, payload?.source || "slskd", message);
   const nextPayload = buildNextSourcePayload(payload, payload?.source || "slskd", message);
   if (nextPayload) {
     logger.info("slskd", "Trying next download source", {
@@ -422,6 +435,33 @@ async function failOrTryNextSource(payload, job, message, logDetails = {}) {
   return null;
 }
 
+// A dedup claim refusal is transient contention, not a source failure: never
+// record failure memory, keep the refused source out of triedSources and the
+// user-facing error summary, and never fail the job while another job's
+// completion may still clear the claim. When no alternative source remains,
+// re-enqueue the same payload after a delay (the continuePipeline retry path
+// used by deferForInactiveOwner) so the claim is retried once it is released.
+function deferOrTryNextSource(payload, job, reason) {
+  const nextPayload = buildNextSourcePayload(payload, null, null);
+  if (nextPayload) {
+    logger.info("slskd", "Trying next download source after dedup refusal", {
+      jobId: job?.id,
+      refusedSource: payload?.source || "slskd",
+      nextSource: nextPayload.source,
+      reason,
+    });
+    downloadTracker.clearSlskdDispatched(job.id);
+    return nextPayload;
+  }
+  logger.info("dedup", "Deferring job, release actively downloading on another source", {
+    jobId: job?.id,
+    source: payload?.source || "slskd",
+    reason,
+    delaySeconds: DEDUP_DEFER_SECONDS,
+  });
+  return { ...payload, delaySeconds: DEDUP_DEFER_SECONDS };
+}
+
 export async function failPipelineJob(payload, message) {
   const jobId = payload?.jobId;
   if (!jobId) return;
@@ -429,6 +469,9 @@ export async function failPipelineJob(payload, message) {
   const job = downloadTracker.getJob(jobId);
   if (!job) return;
   if (job.status === "downloading" || job.status === "pending") {
+    // failOrTryNextSource already records the failure when it falls through
+    // to failJob; only count failures that reach this path directly.
+    recordSourceFailure(payload, payload?.source || "slskd", message);
     await failJob(job, message);
   }
 }
@@ -795,6 +838,10 @@ async function handleSearch(payload) {
   if (!job) return null;
   if (job.status === "failed" || job.status === "done") return null;
   downloadTracker.setDownloading(job.id);
+  const claim = markActive(getReleaseKeys(payload), payload.source || "slskd", job.id);
+  if (!claim.claimed) {
+    return deferOrTryNextSource(payload, job, claim.reason);
+  }
   downloadTracker.updateDownloadMetadata(job.id, {
     downloadSource: "slskd",
   });
@@ -1316,21 +1363,30 @@ export async function processPipelinePayload(payload) {
       const job = downloadTracker.getJob(payload.jobId);
       return job ? failOrTryNextSource(payload, job, "Usenet is not configured") : null;
     }
-    return processUsenetPipelinePayload(payload, { failOrTryNextSource });
+    return processUsenetPipelinePayload(payload, {
+      failOrTryNextSource,
+      deferOrTryNextSource,
+    });
   }
   if (payload.source === "deemix") {
     if (!isSourceConfigured("deemix")) {
       const job = downloadTracker.getJob(payload.jobId);
       return job ? failOrTryNextSource(payload, job, "deemix is not configured") : null;
     }
-    return processDeemixPipelinePayload(payload, { failOrTryNextSource });
+    return processDeemixPipelinePayload(payload, {
+      failOrTryNextSource,
+      deferOrTryNextSource,
+    });
   }
   if (payload.source === "ytdlp") {
     if (!isSourceConfigured("ytdlp")) {
       const job = downloadTracker.getJob(payload.jobId);
       return job ? failOrTryNextSource(payload, job, "yt-dlp is not configured") : null;
     }
-    return processYtdlpPipelinePayload(payload, { failOrTryNextSource });
+    return processYtdlpPipelinePayload(payload, {
+      failOrTryNextSource,
+      deferOrTryNextSource,
+    });
   }
   if (payload.source !== "slskd") {
     const job = downloadTracker.getJob(payload.jobId);

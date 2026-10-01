@@ -26,6 +26,7 @@ const FLOW_COMMANDS = new Set([
   "runQualityUpgradeChecks", "queueQualityUpgradeForJob", "clearPendingByPlaylist",
   "wakeOrStart", "syncSharedPlaylistImport",
   "enqueueManualMissingSelection", "enqueueManualReplacementSelection",
+  "getDedupStats",
 ]);
 
 async function handleFlowCommand(message) {
@@ -81,6 +82,9 @@ async function handleFlowCommand(message) {
           },
         };
       }
+    } else if (method === "getDedupStats") {
+      const { getStats } = await import("./downloadDedupService.js");
+      result = getStats();
     } else {
       result = await flowWorker[method](...args);
     }

@@ -36,6 +36,7 @@ import {
   isPipelinePayloadActive,
   withPipelineCommitLock,
 } from "./weeklyFlow/weeklyFlowDownloadCancellation.js";
+import { getReleaseKeys, markActive } from "./downloadDedupService.js";
 
 const SEARCH_LIMIT = 10;
 const POLL_DELAY_SECONDS = 3;
@@ -98,6 +99,10 @@ async function handleDeemixSearch(payload, helpers) {
     return helpers.failOrTryNextSource(payload, job, unusableUpgrade);
   }
   downloadTracker.setDownloading(job.id);
+  const claim = markActive(getReleaseKeys(payload), payload.source || "deemix", job.id);
+  if (!claim.claimed) {
+    return helpers.deferOrTryNextSource(payload, job, claim.reason);
+  }
   downloadTracker.updateDownloadMetadata(job.id, {
     downloadSource: "deemix",
     downloadClient: "deemix",

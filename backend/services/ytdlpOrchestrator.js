@@ -34,6 +34,7 @@ import {
   isPipelinePayloadActive,
   withPipelineCommitLock,
 } from "./weeklyFlow/weeklyFlowDownloadCancellation.js";
+import { getReleaseKeys, markActive } from "./downloadDedupService.js";
 
 const ytdlpClient = getDownloadClient("ytdlp");
 const LIVE_STATUSES = new Set(["is_live", "was_live", "post_live", "is_upcoming"]);
@@ -56,6 +57,10 @@ async function handleYtdlpSearch(payload, helpers) {
   if (!job) return null;
   if (job.status === "failed" || job.status === "done") return null;
   downloadTracker.setDownloading(job.id);
+  const claim = markActive(getReleaseKeys(payload), payload.source || "ytdlp", job.id);
+  if (!claim.claimed) {
+    return helpers.deferOrTryNextSource(payload, job, claim.reason);
+  }
   downloadTracker.updateDownloadMetadata(job.id, {
     downloadSource: "ytdlp",
     downloadClient: "ytdlp",

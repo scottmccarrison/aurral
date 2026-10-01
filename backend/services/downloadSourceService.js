@@ -102,10 +102,29 @@ export function getEnabledDownloadSources() {
   if (status.usenet.configured) sources.push(status.usenet);
   if (status.deemix.configured) sources.push(status.deemix);
   if (status.ytdlp.configured) sources.push(status.ytdlp);
-  return sources.sort((left, right) => {
+  const byPriority = (left, right) => {
     if (left.priority !== right.priority) return left.priority - right.priority;
     return left.id.localeCompare(right.id);
-  });
+  };
+  const preferredOrder = dbOps.getSettings()?.sources?.preferredOrder;
+  if (Array.isArray(preferredOrder) && preferredOrder.length > 0) {
+    // Listed sources come first in configured order; unlisted sources keep
+    // priority order after them.
+    const rank = new Map(
+      preferredOrder
+        .map((id, index) => [String(id || "").trim(), index])
+        .filter(([id]) => id),
+    );
+    return sources.sort((left, right) => {
+      const leftRank = rank.has(left.id) ? rank.get(left.id) : Number.MAX_SAFE_INTEGER;
+      const rightRank = rank.has(right.id)
+        ? rank.get(right.id)
+        : Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      return byPriority(left, right);
+    });
+  }
+  return sources.sort(byPriority);
 }
 
 export function isAnyDownloadSourceConfigured() {

@@ -22,6 +22,11 @@ import {
   isDownloadJobCancelled,
   isPipelinePayloadActive,
 } from "./weeklyFlowDownloadCancellation.js";
+import {
+  clearJob as clearDedupJob,
+  getReleaseKeys,
+  markComplete,
+} from "../downloadDedupService.js";
 
 const parseDeniedSources = (raw) => {
   if (!raw) return [];
@@ -991,6 +996,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job) return false;
     cancelDownloadJob(id);
     this.clearSlskdPipelineState(id);
+    clearDedupJob(id);
     this.jobs.delete(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
@@ -1119,6 +1125,7 @@ export class WeeklyFlowDownloadTracker {
     const previousStatus = job.status;
     const asRetryCycle = options?.asRetryCycle === true;
     this.clearSlskdPipelineState(id);
+    clearDedupJob(id);
     job.status = "pending";
     job.startedAt = null;
     job.completedAt = null;
@@ -1184,6 +1191,7 @@ export class WeeklyFlowDownloadTracker {
     }
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
+    clearDedupJob(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1218,6 +1226,11 @@ export class WeeklyFlowDownloadTracker {
     }
     this._update(job);
     this._applyStatusDelta(job.playlistType, previousStatus, job.status);
+    // The release landed: clear every identity it could have been claimed
+    // under (jobs gain releaseGuid mid-lifecycle) and forget its failures.
+    for (const releaseKey of getReleaseKeys(job)) {
+      markComplete(releaseKey);
+    }
     return true;
   }
 
@@ -1226,6 +1239,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
+    clearDedupJob(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1243,6 +1257,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
+    clearDedupJob(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1340,6 +1355,7 @@ export class WeeklyFlowDownloadTracker {
       if (job.status === "downloading") {
         const previousStatus = job.status;
         this.clearSlskdPipelineState(job.id);
+        clearDedupJob(job.id);
         job.status = "pending";
         job.startedAt = null;
         job.stagingPath = null;
@@ -1378,6 +1394,7 @@ export class WeeklyFlowDownloadTracker {
       if (job.status !== "pending" && job.status !== "downloading") continue;
       const previousStatus = job.status;
       this.clearSlskdPipelineState(job.id);
+      clearDedupJob(job.id);
       this.pendingSet.delete(job.id);
       this.pendingRetrySet.delete(job.id);
       this._removeFromPendingQueues(job.id);
@@ -1462,6 +1479,7 @@ export class WeeklyFlowDownloadTracker {
     }
     cancelDownloadJobs(toDelete);
     for (const id of toDelete) {
+      clearDedupJob(id);
       this.jobs.delete(id);
       if (cleanPending) {
         this.pendingSet.delete(id);
@@ -1506,6 +1524,9 @@ export class WeeklyFlowDownloadTracker {
 
   clearAll() {
     const count = this.jobs.size;
+    for (const id of this.jobs.keys()) {
+      clearDedupJob(id);
+    }
     this.jobs.clear();
     this.statsByPlaylistType.clear();
     this.globalStats = this._emptyStats();

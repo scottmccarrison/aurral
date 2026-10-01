@@ -188,5 +188,12 @@ export const defaultData = {
       reviewTimeoutHours: 48,       // Auto-deny reviews after this many hours
       reviewAction: "hold",         // "hold" (current), "auto-deny", or "retry-next-candidate"
     },
+    sources: {
+      deduplication: true,
+      failureMemoryHours: 24,
+      maxRetriesPerSource: 3,
+      // Example custom order: ["deemix", "slskd", "usenet", "ytdlp"]
+      preferredOrder: [],
+    },
   },
 };
