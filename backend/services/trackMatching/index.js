@@ -37,7 +37,15 @@ export {
   evaluateTrackIdentity,
   recommendationFromDistance,
   MATCHER_UNAVAILABLE_MESSAGE,
+  editionRenumberingGate,
 } from "./identityPolicy.js";
+export {
+  detectAlbumVersion,
+  albumNamesVariant,
+  confirmEditionRenumbering,
+  fetchReleaseTracklist,
+  clearReleaseTracklistCache,
+} from "./albumVersion.js";
 export {
   validateDownloadedTrackFile,
   selectVerifiedDownloadedFile,

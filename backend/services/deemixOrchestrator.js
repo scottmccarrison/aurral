@@ -330,6 +330,9 @@ async function handleDeemixFinalize(payload, helpers) {
     return helpers.failOrTryNextSource(payload, job, reason);
   }
 
+  // Settings live in search-handler scope, not here; the finalize handler reads
+  // them itself so album-version-aware validation honors settings.matching.
+  const settings = dbOps.getSettings();
   const validation = await validateDownloadedTrackFile({
     request: resolvedTrack,
     candidate: candidate?.candidate || candidate,
@@ -338,6 +341,7 @@ async function handleDeemixFinalize(payload, helpers) {
     options: {
       strict: candidate?.evaluation?.decision !== "accept",
       manualSelection: payload.manualSelection === true,
+      settings,
     },
   });
   if (!isPipelinePayloadActive(payload)) {
