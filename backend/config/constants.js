@@ -187,6 +187,10 @@ export const defaultData = {
       autoDenyDistance: 0.50,       // Above this distance = auto-deny (don't hold for review)
       reviewTimeoutHours: 48,       // Auto-deny reviews after this many hours
       reviewAction: "hold",         // "hold" (current), "auto-deny", or "retry-next-candidate"
+      // Post-download tolerance
+      trackNumberMismatchTolerance: true,  // deluxe/standard renumbering tolerance (existing heuristic, now switchable)
+      albumVersionMatching: true,          // edition detection + tracklist-aware validation
+      requireExactAlbumMatch: false,       // true = album-name mismatch forces AMBIGUOUS even if tracklist confirms
     },
     sources: {
       deduplication: true,

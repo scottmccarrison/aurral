@@ -141,6 +141,7 @@ export function registerGeneral(router) {
         playlistArtwork,
         inbox,
         dateTimeFormat,
+        matching,
       } = req.body;
 
       if (dateTimeFormat !== undefined && !DATE_TIME_FORMATS.includes(dateTimeFormat)) {
@@ -546,6 +547,15 @@ export function registerGeneral(router) {
               }
             : currentSettings.playlistArtwork ||
               defaultData.settings.playlistArtwork,
+        matching:
+          matching !== undefined
+            ? {
+                ...(currentSettings.matching ||
+                  defaultData.settings.matching),
+                ...matching,
+              }
+            : currentSettings.matching ||
+              defaultData.settings.matching,
       };
 
       if (updatedSettings?.integrations?.coverArtArchive) {

@@ -94,6 +94,46 @@ function normalizeSourceSettings(raw) {
   };
 }
 
+function normalizeMatchingSettings(raw) {
+  const matching = raw && typeof raw === "object" ? raw : {};
+  const parsedApprove = Number(matching.autoApproveDistance);
+  const autoApproveDistance =
+    Number.isFinite(parsedApprove) && parsedApprove >= 0 && parsedApprove <= 1
+      ? parsedApprove
+      : 0.10;
+  const parsedDeny = Number(matching.autoDenyDistance);
+  const autoDenyDistance =
+    Number.isFinite(parsedDeny) && parsedDeny >= 0 && parsedDeny <= 1
+      ? parsedDeny
+      : 0.50;
+  // Sanity check: if both are valid but approve > deny, reset both to defaults
+  const finalAutoApproveDistance =
+    autoApproveDistance > autoDenyDistance ? 0.10 : autoApproveDistance;
+  const finalAutoDenyDistance =
+    autoApproveDistance > autoDenyDistance ? 0.50 : autoDenyDistance;
+  const parsedTimeout = Number(matching.reviewTimeoutHours);
+  const reviewTimeoutHours =
+    Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 48;
+  const reviewAction = String(matching.reviewAction || "hold")
+    .trim()
+    .toLowerCase();
+  const validReviewActions = ["hold", "auto-deny", "retry-next-candidate"];
+  const finalReviewAction = validReviewActions.includes(reviewAction)
+    ? reviewAction
+    : "hold";
+  // Preserve unknown matching.* keys on round-trip (intentionally diverges from whitelist normalizers)
+  return {
+    ...matching,
+    autoApproveDistance: finalAutoApproveDistance,
+    autoDenyDistance: finalAutoDenyDistance,
+    reviewTimeoutHours,
+    reviewAction: finalReviewAction,
+    trackNumberMismatchTolerance: matching.trackNumberMismatchTolerance !== false,
+    albumVersionMatching: matching.albumVersionMatching !== false,
+    requireExactAlbumMatch: matching.requireExactAlbumMatch === true,
+  };
+}
+
 function getOrCreateEncryptionKey() {
   const row = getSettingStmt.get("_encryptionKey");
   if (row?.value) {
@@ -201,6 +241,7 @@ export const dbOps = {
       readStoredSettingJson("playlistArtwork"),
     );
     const sources = normalizeSourceSettings(readStoredSettingJson("sources"));
+    const matching = normalizeMatchingSettings(readStoredSettingJson("matching"));
     const inbox = dbHelpers.parseJSON(getSettingStmt.get("inbox")?.value) || {};
     const blocklist = dbHelpers.parseJSON(
       getSettingStmt.get("blocklist")?.value
@@ -244,6 +285,7 @@ export const dbOps = {
       playlistWorker,
       playlistArtwork,
       sources,
+      matching,
       inbox: {
         enabled: inbox.enabled !== false,
         releases: inbox.releases !== false,
@@ -416,6 +458,12 @@ export const dbOps = {
         upsertSettingStmt.run(
           "sources",
           dbHelpers.stringifyJSON(normalizeSourceSettings(settings.sources)),
+        );
+      }
+      if (settings.matching !== undefined) {
+        upsertSettingStmt.run(
+          "matching",
+          dbHelpers.stringifyJSON(normalizeMatchingSettings(settings.matching)),
         );
       }
       if (settings.blocklist !== undefined) {
