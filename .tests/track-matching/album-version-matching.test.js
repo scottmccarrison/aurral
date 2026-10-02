@@ -367,6 +367,68 @@ ptest("d: contradicted tracklist disables the tolerance patch and holds for revi
   assert.deepEqual(mock.calls, [DELUXE_RELEASE_MBID], "the contradicted tracklist was fetched");
 });
 
+// --- H1 fix: sibling override skipped for unverified editions ----------------
+
+ptest("H1a: edition-eligible + tracklist NULL → tolerance patch VERIFIED, NOT flipped to CONFLICTED by sibling override", async () => {
+  // File claims track 5 (which does NOT match the request's track-5 sibling title),
+  // album names differ (edition-eligible), tracklist fetch returns NULL.
+  // The tolerance patch should verify, and the sibling override should be skipped
+  // because editionGate.eligible is true.
+  const mock = tracklistMock(null);
+  const outcome = await validateDownloadedTrackFile({
+    request: { ...CALICO_REQUEST, albumTrackTitles: STANDARD_TRACK_TITLES },
+    filePath: "/staging/05 - Calico Creek (Acoustic).flac",
+    source: "soulseek",
+    options: {
+      ...MATCHER,
+      parseFile: stubParseFile(
+        stubParsed({
+          title: "Calico Creek (Acoustic)",
+          artist: "The Hollow Oaks",
+          album: "Calico Creek (Deluxe)", // different from request "Calico Creek" → edition-eligible
+          track: 5, // file claims track 5
+          albumid: DELUXE_RELEASE_MBID,
+        }),
+      ),
+      fetchReleaseTracklist: mock.fetchReleaseTracklist,
+      settings: { matching: { trackNumberMismatchTolerance: true } },
+    },
+  });
+  // The tolerance patch should verify (tracklist unavailable, tolerance ON).
+  // The sibling override should NOT flip it to CONFLICTED because editionGate.eligible is true.
+  assert.equal(outcome.decision, POST_DOWNLOAD_DECISIONS.VERIFIED);
+  assert.equal(outcome.reason, null, "tolerance patch verifies without edition reason");
+  assert.equal(outcome.valid, true);
+  assert.deepEqual(mock.calls, [DELUXE_RELEASE_MBID], "the fetch was attempted and returned null");
+});
+
+ptest("H1b: same edition (gate NOT eligible) + sibling at index → CONFLICTED (unchanged behavior)", async () => {
+  // File claims track 5, request track 15, same album name "Calico Creek" (NOT edition-eligible).
+  // Track 5 of the request is "Cedar Grove" (a sibling), so siblingAtIndex is true.
+  // The sibling override should flip VERIFIED to CONFLICTED because editionGate.eligible is false.
+  const outcome = await validateDownloadedTrackFile({
+    request: { ...RIVER_REQUEST, albumTrackTitles: RIVER_TRACK_TITLES },
+    filePath: "/staging/05 - River Song.flac",
+    source: "soulseek",
+    options: {
+      ...MATCHER,
+      parseFile: stubParseFile(
+        stubParsed({
+          title: "River Song",
+          artist: "The Hollow Oaks",
+          album: "Calico Creek", // same as request → NOT edition-eligible
+          track: 5,
+        }),
+      ),
+      settings: { matching: { trackNumberMismatchTolerance: true } },
+    },
+  });
+  // Same edition, sibling at index → CONFLICTED with sibling reason.
+  assert.equal(outcome.decision, POST_DOWNLOAD_DECISIONS.CONFLICTED);
+  assert.equal(outcome.valid, false);
+  assert.match(outcome.reason, /sibling track/i);
+});
+
 // --- e. requireExactAlbumMatch hard gate -------------------------------------
 
 ptest("e: requireExactAlbumMatch caps verification at review even when the tracklist would confirm", async () => {

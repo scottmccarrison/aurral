@@ -166,6 +166,25 @@ test("route level: POST /api/settings with matching persists and GET returns val
   assert.equal(matching.requireExactAlbumMatch, true);
 });
 
+test("M1: null/empty string numeric fields coerce to defaults, not 0", async () => {
+  const { postSettings, getSettings } = captureSettingsRoutes();
+  const response = await postSettings({
+    matching: {
+      autoApproveDistance: null,
+      autoDenyDistance: "",
+      reviewTimeoutHours: null,
+    },
+  });
+  assert.equal(response.statusCode, 200);
+
+  const saved = await getSettings();
+  assert.equal(saved.statusCode, 200);
+  const matching = saved.body.matching;
+  assert.equal(matching.autoApproveDistance, 0.10, "autoApproveDistance: null should default to 0.10, not coerce to 0");
+  assert.equal(matching.autoDenyDistance, 0.50, "autoDenyDistance: empty string should default to 0.50, not coerce to 0");
+  assert.equal(matching.reviewTimeoutHours, 48, "reviewTimeoutHours: null should default to 48, not coerce to 0");
+});
+
 function captureSettingsRoutes() {
   const routes = {};
   registerGeneral({

@@ -96,12 +96,14 @@ function normalizeSourceSettings(raw) {
 
 function normalizeMatchingSettings(raw) {
   const matching = raw && typeof raw === "object" ? raw : {};
-  const parsedApprove = Number(matching.autoApproveDistance);
+  const rawApprove = matching.autoApproveDistance;
+  const parsedApprove = rawApprove === null || rawApprove === undefined || rawApprove === "" ? NaN : Number(rawApprove);
   const autoApproveDistance =
     Number.isFinite(parsedApprove) && parsedApprove >= 0 && parsedApprove <= 1
       ? parsedApprove
       : 0.10;
-  const parsedDeny = Number(matching.autoDenyDistance);
+  const rawDeny = matching.autoDenyDistance;
+  const parsedDeny = rawDeny === null || rawDeny === undefined || rawDeny === "" ? NaN : Number(rawDeny);
   const autoDenyDistance =
     Number.isFinite(parsedDeny) && parsedDeny >= 0 && parsedDeny <= 1
       ? parsedDeny
@@ -111,7 +113,8 @@ function normalizeMatchingSettings(raw) {
     autoApproveDistance > autoDenyDistance ? 0.10 : autoApproveDistance;
   const finalAutoDenyDistance =
     autoApproveDistance > autoDenyDistance ? 0.50 : autoDenyDistance;
-  const parsedTimeout = Number(matching.reviewTimeoutHours);
+  const rawTimeout = matching.reviewTimeoutHours;
+  const parsedTimeout = rawTimeout === null || rawTimeout === undefined || rawTimeout === "" ? NaN : Number(rawTimeout);
   const reviewTimeoutHours =
     Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 48;
   const reviewAction = String(matching.reviewAction || "hold")

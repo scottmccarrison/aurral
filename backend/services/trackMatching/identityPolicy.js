@@ -481,7 +481,7 @@ function evaluatePostDownload({
     reason = `downloaded file does not match the requested track (distance ${base.distance})`;
   }
 
-  if (decision === "VERIFIED" && evidence.trackNumber.siblingAtIndex) {
+  if (decision === "VERIFIED" && evidence.trackNumber.siblingAtIndex && !editionGate.eligible) {
     decision = "CONFLICTED";
     reason = "embedded title names a sibling track from the requested release";
   }
