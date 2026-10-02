@@ -33,6 +33,9 @@ const { getAurralHistoryRequests } = historyModule;
 const { downloadTracker } = await importFromRepo(
   "backend/services/weeklyFlow/weeklyFlowDownloadTracker.js",
 );
+const { cancelDownloadJob } = await importFromRepo(
+  "backend/services/weeklyFlow/weeklyFlowDownloadCancellation.js",
+);
 
 const HOUR_MS = 60 * 60 * 1000;
 // Synthetic clock: 49h past the real "now" makes 48h-stale jobs due without sleeping.
@@ -283,6 +286,36 @@ test("a stale review with no derivable deny key stays held for a human", async (
   assert.deepEqual(job.deniedRemoteSources ?? [], []);
   assert.equal(metrics.scanned, 1);
   assert.equal(metrics.skipped, 1);
+  assert.equal(metrics.denied, 0);
+  assert.equal(metrics.failed, 0);
+});
+
+test("a refused transition is counted skipped and writes no history", async () => {
+  // Create a blocked stale job with a requestGroupId, then mark the group as cancelled.
+  // This causes _isCancelledAlbumJob to return true, which makes setFailed/setPending refuse.
+  const groupId = "cancelled-group-1";
+  const jobId = downloadTracker.addJob(
+    {
+      artistName: "Artist",
+      trackName: "Cancelled Song",
+      albumName: "Album",
+      requestGroupId: groupId,
+    },
+    "playlist-1",
+  );
+  downloadTracker.updateDownloadMetadata(jobId, { downloadSource: "usenet", releaseGuid: "guid-cancelled" });
+  downloadTracker.setBlocked(jobId, "blocked-duration-mismatch");
+  backdateJob(jobId, 49);
+
+  // Mark the job as cancelled so the transition will refuse.
+  cancelDownloadJob(jobId);
+
+  const metrics = await enforceReviewTimeouts({ now: staleNow() });
+
+  const job = downloadTracker.getJob(jobId);
+  assert.equal(job.status, "blocked", "job must remain blocked when transition is refused");
+  assert.equal(metrics.scanned, 1);
+  assert.equal(metrics.skipped, 1, "refused transition must be counted as skipped");
   assert.equal(metrics.denied, 0);
   assert.equal(metrics.failed, 0);
 });

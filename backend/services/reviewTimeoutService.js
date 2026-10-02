@@ -41,7 +41,13 @@ export async function resolveTimedOutReview(job, reason, reviewAction) {
     });
   }
   if (reviewAction === "auto-deny") {
-    downloadTracker.setFailed(job.id, reason);
+    const transitioned = downloadTracker.setFailed(job.id, reason);
+    if (!transitioned) {
+      logger.warn("review-timeout", "setFailed refused transition; leaving job untouched", {
+        jobId: job.id,
+      });
+      return { action: "skipped" };
+    }
     recordTrackJobFailed(job, reason);
     logger.info("review-timeout", "Auto-failed stale review", { jobId: job.id, reason });
     return { action: "failed" };
@@ -49,7 +55,13 @@ export async function resolveTimedOutReview(job, reason, reviewAction) {
   const key = deniedSourceKeyFor(job);
   if (job.downloadSource && key) {
     downloadTracker.recordDeniedSource(job.id, job.downloadSource, key);
-    downloadTracker.setPending(job.id, reason, { asRetryCycle: false });
+    const transitioned = downloadTracker.setPending(job.id, reason, { asRetryCycle: false });
+    if (!transitioned) {
+      logger.warn("review-timeout", "setPending refused transition; leaving job untouched", {
+        jobId: job.id,
+      });
+      return { action: "skipped" };
+    }
     recordTrackJobFailed(job, `${reason} — retrying next candidate`);
     logger.info("review-timeout", "Auto-denied stale review", { jobId: job.id, reason });
     return { action: "denied" };
@@ -72,6 +84,7 @@ export async function enforceReviewTimeouts({ now = Date.now() } = {}) {
     failed: 0,
     skipped: 0,
     deferred: 0,
+    errored: 0,
     errors: [],
   };
   if (reviewTimeoutHours <= 0) {
@@ -116,6 +129,7 @@ export async function enforceReviewTimeouts({ now = Date.now() } = {}) {
         metrics.skipped += 1;
       }
     } catch (error) {
+      metrics.errored += 1;
       metrics.errors.push({ jobId: job.id, error: error?.message || String(error) });
     }
   }
@@ -134,6 +148,7 @@ export async function enforceReviewTimeouts({ now = Date.now() } = {}) {
     failed: metrics.failed,
     skipped: metrics.skipped,
     deferred: metrics.deferred,
+    errored: metrics.errored,
     errorCount: metrics.errors.length,
     reviewAction,
     reviewTimeoutHours,
