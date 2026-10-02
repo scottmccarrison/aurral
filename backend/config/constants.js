@@ -185,7 +185,7 @@ export const defaultData = {
       // Pre-download thresholds
       autoApproveDistance: 0.10,    // Below this distance = auto-approve (skip review)
       autoDenyDistance: 0.50,       // Above this distance = auto-deny (don't hold for review)
-      reviewTimeoutHours: 48,       // Auto-deny reviews after this many hours
+      reviewTimeoutHours: 48,       // Auto-resolve reviews older than this many hours; 0 = disabled (keep held forever)
       reviewAction: "hold",         // "hold" (current), "auto-deny", or "retry-next-candidate"
       // Post-download tolerance
       trackNumberMismatchTolerance: true,  // deluxe/standard renumbering tolerance (existing heuristic, now switchable)
