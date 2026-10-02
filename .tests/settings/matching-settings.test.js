@@ -83,6 +83,7 @@ test("clamps and validates: invalid values reset to defaults", async () => {
   assert.equal(matching.reviewTimeoutHours, 48, "reviewTimeoutHours: 0 should default to 48");
   assert.equal(matching.reviewAction, "hold", "reviewAction: banana should default to hold");
   assert.equal(matching.trackNumberMismatchTolerance, false, "trackNumberMismatchTolerance: false should be preserved");
+  assert.equal(matching.albumVersionMatching, true, "albumVersionMatching: not provided should default to true");
   assert.equal(matching.requireExactAlbumMatch, true, "requireExactAlbumMatch: true should be preserved");
 });
 
