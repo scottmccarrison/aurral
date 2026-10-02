@@ -46,6 +46,50 @@ const idFor = (kind, key) =>
   `${kind}:${encodeURIComponent(String(key)).replaceAll("%3A", ":")}`;
 const LIBRARY_IMAGE_PROFILE = "library";
 
+// Rate limiter for favorite-driven download job creation
+const FAVORITE_JOB_MAX_PER_MINUTE = 50;
+const WINDOW_DURATION_MS = 60000; // 60 seconds
+
+let favoriteJobCreationTimestamps = [];
+let skippedFavoriteJobCount = 0;
+let lastSkipLogTime = 0;
+
+const checkFavoriteJobRateLimit = (now = Date.now()) => {
+  // Prune timestamps older than the window
+  const windowStart = now - WINDOW_DURATION_MS;
+  favoriteJobCreationTimestamps = favoriteJobCreationTimestamps.filter(
+    (timestamp) => timestamp > windowStart,
+  );
+
+  const canCreate = favoriteJobCreationTimestamps.length < FAVORITE_JOB_MAX_PER_MINUTE;
+  if (canCreate) {
+    favoriteJobCreationTimestamps.push(now);
+  } else {
+    skippedFavoriteJobCount++;
+    // Log only on first skip of the window to avoid spam
+    if (now - lastSkipLogTime >= WINDOW_DURATION_MS) {
+      logger.warn("subsonic", "Favorite download jobs skipped (rate limit)", {
+        skippedTotal: skippedFavoriteJobCount,
+      });
+      lastSkipLogTime = now;
+    }
+  }
+  return canCreate;
+};
+
+export const getFavoriteJobStats = () => ({
+  createdInWindow: favoriteJobCreationTimestamps.length,
+  windowStartedAt: new Date(Date.now() - WINDOW_DURATION_MS).toISOString(),
+  skippedTotal: skippedFavoriteJobCount,
+  maxPerMinute: FAVORITE_JOB_MAX_PER_MINUTE,
+});
+
+export const resetFavoriteJobRateLimiterForTests = () => {
+  favoriteJobCreationTimestamps = [];
+  skippedFavoriteJobCount = 0;
+  lastSkipLogTime = 0;
+};
+
 const parseId = (value) => {
   const match = /^(artist|album|song|flow|flow-song|shared|shared-song):(.+)$/.exec(String(value || ""));
   if (!match) return null;
@@ -697,50 +741,56 @@ const canonicalStarRows = (user, rows) => {
   });
 };
 
-const ensureLibraryJob = (track, createdJobIds = null) => {
-  const existing = findLibraryJob(track);
-  if (existing) {
-    if (existing.status === "failed") {
-      downloadTracker.setPending(existing.id, "Requested again", { asRetryCycle: true });
-    }
-    if (existing.status !== "done") {
-      weeklyFlowWorker.start().catch((error) => {
-        logger.error("subsonic", "Could not start download for a playlist track", {
-          jobId: existing.id,
-          reason: error?.message || String(error),
-        });
-      });
-    }
-    return existing.id;
-  }
+const ensureLibraryJob = (track, createdJobIds = null, isRateLimited = false) => {
+   const existing = findLibraryJob(track);
+   if (existing) {
+     if (existing.status === "failed") {
+       downloadTracker.setPending(existing.id, "Requested again", { asRetryCycle: true });
+     }
+     if (existing.status !== "done") {
+       weeklyFlowWorker.start().catch((error) => {
+         logger.error("subsonic", "Could not start download for a playlist track", {
+           jobId: existing.id,
+           reason: error?.message || String(error),
+         });
+       });
+     }
+     return existing.id;
+   }
 
-  const jobId = downloadTracker.addJob(track, "library");
-  if (!jobId) return null;
-  if (createdJobIds) createdJobIds.push(jobId);
-  const owned = findAvailableCanonicalFile(track);
-  if (owned) {
-    downloadTracker.setDone(jobId, owned.file.path, owned.albumName || track.albumName || null);
-    return jobId;
-  }
-  const reusableSource = findReusableLibrarySource(track);
-  if (reusableSource) {
-    downloadTracker.setDone(
-      jobId,
-      reusableSource.finalPath,
-      reusableSource.albumName || track.albumName || null,
-      reusableSource.externalPath || null,
-    );
-    return jobId;
-  }
-  recordTrackJobQueued(downloadTracker.getJob(jobId));
-  weeklyFlowWorker.start().catch((error) => {
-    logger.error("subsonic", "Could not start download for a playlist track", {
-      jobId,
-      reason: error?.message || String(error),
-    });
-  });
-  return jobId;
-};
+   // Rate limit applies only to NEW job creation
+   if (isRateLimited && !checkFavoriteJobRateLimit()) {
+     // Budget exhausted; skip job creation but don't fail the operation
+     return "skipped";
+   }
+
+   const jobId = downloadTracker.addJob(track, "library");
+   if (!jobId) return null;
+   if (createdJobIds) createdJobIds.push(jobId);
+   const owned = findAvailableCanonicalFile(track);
+   if (owned) {
+     downloadTracker.setDone(jobId, owned.file.path, owned.albumName || track.albumName || null);
+     return jobId;
+   }
+   const reusableSource = findReusableLibrarySource(track);
+   if (reusableSource) {
+     downloadTracker.setDone(
+       jobId,
+       reusableSource.finalPath,
+       reusableSource.albumName || track.albumName || null,
+       reusableSource.externalPath || null,
+     );
+     return jobId;
+   }
+   recordTrackJobQueued(downloadTracker.getJob(jobId));
+   weeklyFlowWorker.start().catch((error) => {
+     logger.error("subsonic", "Could not start download for a playlist track", {
+       jobId,
+       reason: error?.message || String(error),
+     });
+   });
+   return jobId;
+ };
 
 const toCanonicalPlaylistTrack = (track, canonicalJobId) => ({
   ...track,
@@ -968,10 +1018,15 @@ export function starMany(user, values, { skipCanonicalValidation = false } = {})
   if (favoriteAutoKeepEnabled()) {
     const createdJobIds = [];
     for (const entry of playlistSongs.filter(Boolean)) {
-      if (!ensureLibraryJob(entry.track, createdJobIds)) {
+      // Pass isRateLimited=true so ensureLibraryJob checks budget only for NEW creations
+      const result = ensureLibraryJob(entry.track, createdJobIds, true);
+      if (result === null) {
+        // Actual error (e.g., addJob failed)
         for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
         return false;
       }
+      // result can be: existing job id, "skipped" (rate limit), or new job id
+      // All are acceptable; star will be written regardless
     }
   }
   const addStars = db.transaction(() => {
