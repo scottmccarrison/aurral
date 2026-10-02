@@ -34,6 +34,7 @@ import {
 import { getQualityProfile } from "./qualityProfileService.js";
 import { orderAdvertisedQualityCandidates } from "./qualityProfileModel.js";
 import { getReleaseKeys, markActive } from "./downloadDedupService.js";
+import { dbOps } from "../db/helpers/index.js";
 
 const MIN_USENET_CANDIDATES = 2;
 const MAX_DOWNLOAD_CANDIDATES = 5;
@@ -153,7 +154,7 @@ export async function collectDownloadedAudioFiles(historyItem) {
   return uniqueResolvedPaths(files, clientKey);
 }
 
-async function validateDownloadedRelease(audioFilePaths, candidate, resolvedTrack) {
+async function validateDownloadedRelease(audioFilePaths, candidate, resolvedTrack, settings) {
   // Post-download identity is decided by the shared engine: downloaded files
   // are assigned to the expected tracklist with beets when one is available
   // and validated individually against the requested track.
@@ -162,6 +163,9 @@ async function validateDownloadedRelease(audioFilePaths, candidate, resolvedTrac
     filePaths: audioFilePaths,
     candidate,
     source: "usenet",
+    options: {
+      settings,
+    },
   });
 }
 
@@ -416,10 +420,12 @@ async function handleUsenetFinalize(payload, helpers) {
     ...buildResolvedTrack(job, payload.track),
     upgradeForJobId: payload.upgradeForJobId || null,
   };
+  const settings = dbOps.getSettings();
   const found = await validateDownloadedRelease(
     await collectDownloadedAudioFiles(historyItem),
     candidate,
     resolvedTrack,
+    settings,
   );
   if (
     blockPipelineJobForReview({

@@ -11,6 +11,11 @@ import {
 } from "./semanticPolicy.js";
 import { getCapabilities } from "./candidateNormalizer.js";
 import { getNormalizedText } from "../providers/brainzmashRanking.js";
+import {
+  albumNamesVariant,
+  confirmEditionRenumbering,
+  detectAlbumVersion,
+} from "./albumVersion.js";
 
 export const MATCHER_UNAVAILABLE_MESSAGE =
   "Track matcher (bundled beets runtime) is unavailable. Verify the Aurral image installation; matching cannot fall back to a weaker algorithm.";
@@ -24,6 +29,11 @@ export const DEFAULT_MATCH_THRESHOLDS = Object.freeze({
   autoDenyDistance: 0.50,
   reviewTimeoutHours: 48,
   reviewAction: "hold",  // "hold", "auto-deny", "retry-next-candidate"
+  // Album-version-aware post-download validation
+  // (keep in sync with constants.js settings.matching)
+  trackNumberMismatchTolerance: true,
+  albumVersionMatching: true,
+  requireExactAlbumMatch: false,
 });
 
 const DURATION_BASE_TOLERANCE_MS = 25000;
@@ -321,19 +331,140 @@ function evaluatePreDownload({ source, evidence, base, thresholds = DEFAULT_MATC
   return { ...base, decision, reasons };
 }
 
-function evaluatePostDownload({ base, evidence }) {
+// Single source of truth for "may the edition-renumbering tracklist path
+// decide this candidate?" — used by evaluatePostDownload AND by the
+// post-download validator's fetch gate, so the two can never drift.
+//
+// Eligible when album-version matching is on, the track numbers actually
+// mismatch, the albums are not the same known edition (differing edition
+// tokens, same-base-name variant, or an unknown candidate album), and the
+// requireExactAlbumMatch hard gate is off.
+export function editionRenumberingGate({
+  request,
+  candidate,
+  thresholds = DEFAULT_MATCH_THRESHOLDS,
+  trackNumberMismatch = null,
+  candidateAlbum = null,
+} = {}) {
+  const albumVersionMatching =
+    thresholds.albumVersionMatching ??
+    DEFAULT_MATCH_THRESHOLDS.albumVersionMatching;
+  const requireExactAlbumMatch =
+    thresholds.requireExactAlbumMatch ??
+    DEFAULT_MATCH_THRESHOLDS.requireExactAlbumMatch;
+  const albumVersion = detectAlbumVersion(request?.albumName, candidateAlbum);
+  const mismatch =
+    trackNumberMismatch != null
+      ? Boolean(trackNumberMismatch)
+      : readTrackNumberEvidence(request, candidate).mismatch;
+  const eligible =
+    Boolean(albumVersionMatching) &&
+    !requireExactAlbumMatch &&
+    mismatch &&
+    (!albumVersion.matches ||
+      albumNamesVariant(request?.albumName, candidateAlbum) ||
+      albumVersion.candidateUnknown);
+  return { eligible, albumVersion };
+}
+
+function evaluatePostDownload({
+  base,
+  evidence,
+  request,
+  thresholds = DEFAULT_MATCH_THRESHOLDS,
+  editionTracklist = null,
+  editionAlbumFallback = null,
+}) {
+  const candidate = base.candidate;
+  const trackNumberMismatchTolerance =
+    thresholds.trackNumberMismatchTolerance ??
+    DEFAULT_MATCH_THRESHOLDS.trackNumberMismatchTolerance;
+  const requireExactAlbumMatch =
+    thresholds.requireExactAlbumMatch ??
+    DEFAULT_MATCH_THRESHOLDS.requireExactAlbumMatch;
+
+  // (1) Recording identity: a matching recording MBID is decisive on its own.
+  // Only a duration outside the validation window can hold it for review, and
+  // the sibling-index override below is skipped — the job's albumTrackTitles
+  // list describes one edition and is the wrong space to judge an MBID-matched
+  // file's position claim against.
+  if (evidence.identifier.match) {
+    if (evidence.duration.withinValidationWindow) {
+      return { ...base, decision: "VERIFIED", reason: null };
+    }
+    return {
+      ...base,
+      decision: "AMBIGUOUS",
+      reason: `duration mismatch: expected ${evidence.duration.expectedMs}ms, actual ${evidence.duration.actualMs}ms`,
+    };
+  }
+
+  // (2) Album edition evidence: the file's own album tag first, the parsed
+  // pre-download candidate's album as fallback, else unknown.
+  const candidateAlbum = candidate.album || editionAlbumFallback || null;
+  const editionGate = editionRenumberingGate({
+    request,
+    candidate,
+    thresholds,
+    trackNumberMismatch: evidence.trackNumber.mismatch,
+    candidateAlbum,
+  });
+
+  // (3) Tracklist-aware edition path: the file's claimed position is checked
+  // against the tracklist of the FILE's own release (per-medium numbering).
+  // A confirmed position verifies even though the job's track number differs;
+  // a fetched-but-contradicted tracklist disables the tolerance patch below.
+  let editionContradicted = false;
+  if (editionGate.eligible && Array.isArray(editionTracklist) && editionTracklist.length > 0) {
+    const confirmed = confirmEditionRenumbering({
+      tracklist: editionTracklist,
+      discNumber: candidate.discNumber,
+      trackNumber: candidate.trackNumber,
+      fileTitle: candidate.title,
+    });
+    if (confirmed) {
+      // Extra guard: edition renumbering only rescues an otherwise-strong
+      // identity — fuzzy tags or a conflicting duration still need review.
+      if (base.tagsMatchStrongly && evidence.duration.withinValidationWindow) {
+        return { ...base, decision: "VERIFIED", reason: "edition renumbering confirmed" };
+      }
+    } else {
+      editionContradicted = true;
+    }
+  }
+
+  // (4) Same edition (or edition matching unavailable): a sibling title at the
+  // file's claimed index in the REQUESTED release contradicts the file's own
+  // position claim — the requested album's numbering is the right space here.
+  if (
+    !editionGate.eligible &&
+    evidence.trackNumber.mismatch &&
+    evidence.trackNumber.siblingAtIndex
+  ) {
+    return {
+      ...base,
+      decision: "CONFLICTED",
+      reason: "embedded title names a sibling track from the requested release",
+    };
+  }
+
+  // (5) Ordinary tag/shape flow with the track-number tolerance patch.
   let decision;
   let reason = null;
-  if (evidence.identifier.match) {
-    decision = base.shapeAgrees ? "VERIFIED" : "AMBIGUOUS";
-    reason = base.shapeAgrees ? null : "recording MBID matches but the duration conflicts";
-  } else if (base.tagsMatchStrongly && base.shapeAgrees) {
+  if (base.tagsMatchStrongly && base.shapeAgrees) {
     decision = "VERIFIED";
   } else if (base.tagsMatchStrongly) {
     // Strong tag match with shape disagreement. If the only issue is track
     // number mismatch (duration is within tolerance), treat as verified —
-    // this is typically a deluxe/standard edition difference, not a wrong track.
-    if (evidence.duration.withinValidationWindow && evidence.trackNumber.mismatch) {
+    // this is typically a deluxe/standard edition difference, not a wrong
+    // track. A tracklist that contradicted the file's position claim above
+    // disables this relaxation.
+    if (
+      evidence.duration.withinValidationWindow &&
+      evidence.trackNumber.mismatch &&
+      trackNumberMismatchTolerance &&
+      !editionContradicted
+    ) {
       decision = "VERIFIED";
       reason = null;
     } else {
@@ -354,6 +485,16 @@ function evaluatePostDownload({ base, evidence }) {
     decision = "CONFLICTED";
     reason = "embedded title names a sibling track from the requested release";
   }
+
+  // (6) requireExactAlbumMatch hard gate: an album-name mismatch (normalized
+  // comparison in readAlbumEvidence) caps verification at review, even when a
+  // tracklist confirmed the edition renumbering. Step (1) returned early, so
+  // an MBID-verified file is never downgraded by this gate.
+  if (decision === "VERIFIED" && requireExactAlbumMatch && evidence.album === 0) {
+    decision = "AMBIGUOUS";
+    reason = `album mismatch: expected "${request.albumName}", actual "${candidateAlbum}"`;
+  }
+
   return { ...base, decision, reason };
 }
 
@@ -367,6 +508,12 @@ export function evaluateTrackIdentity({
   strict = false,
   phase = "pre",
   allowNoisyCandidates = false,
+  // Album-version-aware post-download evidence. Both are additive and default
+  // to null, so pre-download callers and any post caller that has not fetched
+  // a tracklist keep the exact prior behavior (the edition path is skipped and
+  // the tolerance patch in evaluatePostDownload decides).
+  editionTracklist = null,
+  editionAlbumFallback = null,
 } = {}) {
   const hard = hardConflict({
     request,
@@ -380,7 +527,14 @@ export function evaluateTrackIdentity({
   if (!match) return { ...hard, pending: true };
   const base = baseOutput({ request, candidate, match, evidence: hard, thresholds, phase });
   const evaluated = phase === "post"
-    ? evaluatePostDownload({ base, evidence: hard })
+    ? evaluatePostDownload({
+        base,
+        evidence: hard,
+        request,
+        thresholds,
+        editionTracklist,
+        editionAlbumFallback,
+      })
     : evaluatePreDownload({ source, evidence: hard, base, thresholds });
   return {
     ...hard,

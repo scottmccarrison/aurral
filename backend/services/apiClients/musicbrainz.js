@@ -106,13 +106,17 @@ const getReleaseGroupArtistId = (releaseGroup) => {
   return String(artistCredit[0]?.artist?.id || "").trim() || null;
 };
 
+const musicbrainzUserAgent = () => {
+  const contact =
+    (getMusicBrainzContact() || "").trim() || "https://github.com/aurral";
+  return `${APP_NAME}/${APP_VERSION} ( ${contact} )`;
+};
+
 const officialMusicbrainzRecordingSearch = async (
   mbid,
   { limit = 100, offset = 0, signal } = {},
 ) => {
-  const contact =
-    (getMusicBrainzContact() || "").trim() || "https://github.com/aurral";
-  const userAgent = `${APP_NAME}/${APP_VERSION} ( ${contact} )`;
+  const userAgent = musicbrainzUserAgent();
   const safeLimit = Math.min(
     100,
     Math.max(1, Number.parseInt(limit, 10) || 100),
@@ -135,6 +139,66 @@ const officialMusicbrainzRecordingSearch = async (
     return response.data;
   });
 };
+
+// Maps a MusicBrainz /release lookup (inc=recordings) into a per-medium
+// tracklist. Numbering stays disc-local on purpose: medium.position is the
+// discNumber and track.position is the trackNumber, exactly the space a
+// multi-disc file's tags live in. Never flattened into a global index.
+const mapReleaseTracklist = (releaseData) => {
+  const media = Array.isArray(releaseData?.media) ? releaseData.media : [];
+  const tracks = [];
+  for (const medium of media) {
+    const discNumber =
+      Number.isFinite(Number(medium?.position)) && Number(medium?.position) > 0
+        ? Math.round(Number(medium.position))
+        : 1;
+    const mediumTracks = Array.isArray(medium?.tracks) ? medium.tracks : [];
+    for (const track of mediumTracks) {
+      const title = String(track?.title || track?.recording?.title || "").trim();
+      const trackNumber =
+        Number.isFinite(Number(track?.position)) && Number(track?.position) > 0
+          ? Math.round(Number(track.position))
+          : null;
+      if (!title || trackNumber == null) continue;
+      tracks.push({ discNumber, trackNumber, title });
+    }
+  }
+  return tracks;
+};
+
+/**
+ * Read-only tracklist lookup for a single MusicBrainz RELEASE MBID, used by
+ * album-version-aware post-download validation. Shares the client's rate
+ * limiter and a bounded request timeout. Errors propagate to the caller
+ * (albumVersion.fetchReleaseTracklist wraps this into never-throw semantics).
+ *
+ * @param {string} releaseMbid a release MBID (NOT a release-group MBID)
+ * @returns {Promise<Array<{discNumber: number, trackNumber: number, title: string}>>}
+ */
+export async function musicbrainzGetReleaseTracklist(
+  releaseMbid,
+  { timeoutMs = 8000, signal } = {},
+) {
+  const mbid = String(releaseMbid || "").trim();
+  if (!mbid) return [];
+  const boundedTimeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Number(timeoutMs)
+      : 8000;
+  return mbLimiter.schedule(async () => {
+    signal?.throwIfAborted?.();
+    const response = await axios.get(
+      `${MUSICBRAINZ_API}/release/${encodeURIComponent(mbid)}`,
+      {
+        params: { fmt: "json", inc: "recordings" },
+        headers: { "User-Agent": musicbrainzUserAgent() },
+        timeout: boundedTimeout,
+        signal,
+      },
+    );
+    return mapReleaseTracklist(response.data);
+  });
+}
 
 const mapAppearsOnReleaseGroup = (releaseGroup, release, recording, mbid) => {
   const artistCredit = Array.isArray(releaseGroup?.["artist-credit"])

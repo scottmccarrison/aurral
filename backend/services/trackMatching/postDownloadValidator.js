@@ -31,7 +31,12 @@ import {
   DEFAULT_MATCH_THRESHOLDS,
   MATCHER_UNAVAILABLE_MESSAGE,
   evaluateTrackIdentity,
+  editionRenumberingGate,
 } from "./identityPolicy.js";
+// Namespace import on purpose: albumVersion.js only lazily imports the
+// MusicBrainz client inside fetchReleaseTracklist(), so this stays loadable in
+// DB-free unit tests (the validator must never import dbOps directly).
+import * as albumVersion from "./albumVersion.js";
 import { validateParsedQuality } from "../qualityProfileService.js";
 import { logger } from "../logger.js";
 
@@ -306,7 +311,46 @@ export async function validateDownloadedTrackFile({
       parsedTags: actual,
     };
   }
-  const thresholds = matcherOutcome.result?.thresholds || DEFAULT_MATCH_THRESHOLDS;
+  // Merge matcher thresholds with settings-based thresholds (settings win),
+  // mirroring decisionEngine.js:281-282 so pre- and post-download share one
+  // policy source rather than the matcher's raw defaults.
+  const matcherThresholds = matcherOutcome.result?.thresholds || DEFAULT_MATCH_THRESHOLDS;
+  const thresholds = {
+    ...matcherThresholds,
+    ...{ ...DEFAULT_MATCH_THRESHOLDS, ...(options.settings?.matching || {}) },
+  };
+
+  // Album-version-aware edition path. Spend a MusicBrainz lookup ONLY when the
+  // shared gate says the edition-renumbering path may decide this candidate,
+  // and ONLY for the FILE's own release MBID (musicbrainz_albumid). Never the
+  // request-side albumMbid: trackIdentity.js:45 aliases that to the
+  // release-GROUP MBID, which has no per-medium tracklist. On any miss we relax
+  // the track number check and fall through to the tolerance patch inside
+  // evaluatePostDownload (editionTracklist stays null → step 3 is skipped).
+  const editionAlbumFallback = candidate?.album || null;
+  let editionTracklist = null;
+  const editionGate = editionRenumberingGate({
+    request: trackRequest,
+    candidate: identityCandidate,
+    thresholds,
+    candidateAlbum: identityCandidate.album || editionAlbumFallback || null,
+  });
+  if (editionGate.eligible) {
+    const fileReleaseMbid = identityCandidate.releaseMbid || null;
+    const fetchTracklist =
+      options.fetchReleaseTracklist || albumVersion.fetchReleaseTracklist;
+    if (fileReleaseMbid) {
+      editionTracklist = await fetchTracklist(fileReleaseMbid);
+    }
+    if (!editionTracklist) {
+      logger.debug("match", "Tracklist unavailable; relaxing track number check", {
+        source,
+        filePath,
+        releaseMbid: fileReleaseMbid,
+      });
+    }
+  }
+
   const identity = evaluateTrackIdentity({
     request: trackRequest,
     candidate: identityCandidate,
@@ -315,6 +359,8 @@ export async function validateDownloadedTrackFile({
     thresholds,
     strict,
     phase: "post",
+    editionTracklist,
+    editionAlbumFallback,
   });
   const decision = identity.decision;
   const reason = identity.reason;

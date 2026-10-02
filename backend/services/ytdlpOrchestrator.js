@@ -223,6 +223,9 @@ async function handleYtdlpFinalize(payload, helpers) {
     return helpers.failOrTryNextSource(payload, job, "yt-dlp download missing output file");
   }
 
+  // Settings live in search-handler scope, not here; the finalize handler reads
+  // them itself so album-version-aware validation honors settings.matching.
+  const settings = dbOps.getSettings();
   const validation = await validateDownloadedTrackFile({
     request: resolvedTrack,
     candidate: candidate?.candidate || candidate,
@@ -231,6 +234,7 @@ async function handleYtdlpFinalize(payload, helpers) {
     options: {
       strict: candidate?.evaluation?.decision !== "accept",
       manualSelection: payload.manualSelection === true,
+      settings,
     },
   });
   if (!isPipelinePayloadActive(payload)) {
