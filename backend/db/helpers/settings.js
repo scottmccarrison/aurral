@@ -115,8 +115,9 @@ function normalizeMatchingSettings(raw) {
     autoApproveDistance > autoDenyDistance ? 0.50 : autoDenyDistance;
   const rawTimeout = matching.reviewTimeoutHours;
   const parsedTimeout = rawTimeout === null || rawTimeout === undefined || rawTimeout === "" ? NaN : Number(rawTimeout);
+  // 0 = disabled (review-timeout sweep no-ops); invalid/negative falls back to 48
   const reviewTimeoutHours =
-    Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 48;
+    Number.isFinite(parsedTimeout) && parsedTimeout >= 0 ? parsedTimeout : 48;
   const reviewAction = String(matching.reviewAction || "hold")
     .trim()
     .toLowerCase();

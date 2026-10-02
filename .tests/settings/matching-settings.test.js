@@ -80,7 +80,7 @@ test("clamps and validates: invalid values reset to defaults", async () => {
   const matching = saved.body.matching;
   assert.equal(matching.autoApproveDistance, 0.10, "autoApproveDistance: 5 should clamp to 0.10");
   assert.equal(matching.autoDenyDistance, 0.50, "autoDenyDistance: -1 should clamp to 0.50");
-  assert.equal(matching.reviewTimeoutHours, 48, "reviewTimeoutHours: 0 should default to 48");
+  assert.equal(matching.reviewTimeoutHours, 0, "reviewTimeoutHours: 0 is the kill switch and must be preserved");
   assert.equal(matching.reviewAction, "hold", "reviewAction: banana should default to hold");
   assert.equal(matching.trackNumberMismatchTolerance, false, "trackNumberMismatchTolerance: false should be preserved");
   assert.equal(matching.albumVersionMatching, true, "albumVersionMatching: not provided should default to true");

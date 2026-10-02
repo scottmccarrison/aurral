@@ -127,6 +127,11 @@ export async function processSystemTask(payload = {}, job = null) {
       const result = await maintainSabnzbdQueueHealth();
       return result;
     }
+    case "review-timeout-sweep": {
+      const { enforceReviewTimeouts } = await import("./reviewTimeoutService.js");
+      const result = await enforceReviewTimeouts();
+      return result;
+    }
     case "playlist-startup-migration": {
       const [
         migrationModule,
