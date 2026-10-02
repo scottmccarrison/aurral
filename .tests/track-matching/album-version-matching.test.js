@@ -338,6 +338,35 @@ ptest("d: unavailable tracklist with tolerance off holds the file for review", a
   assert.match(outcome.reason, /track number mismatch: expected 15, actual 34/i);
 });
 
+ptest("d: contradicted tracklist disables the tolerance patch and holds for review", async () => {
+  // The tracklist is fetched successfully, but the title at (disc 1, position 34)
+  // is DIFFERENT from the file's title. This contradicts the file's position claim,
+  // which disables the trackNumberMismatchTolerance patch below.
+  const contradictedTracklist = [
+    { discNumber: 1, trackNumber: 15, title: "Calico Creek" },
+    { discNumber: 1, trackNumber: 33, title: "Willow Lane" },
+    { discNumber: 1, trackNumber: 34, title: "Different Song Title" }, // contradicts file's "Calico Creek (Acoustic)"
+  ];
+  const mock = tracklistMock(contradictedTracklist);
+  const outcome = await validateDownloadedTrackFile({
+    request: { ...CALICO_REQUEST, albumTrackTitles: STANDARD_TRACK_TITLES },
+    filePath: "/staging/34 - Calico Creek (Acoustic).flac",
+    source: "soulseek",
+    options: {
+      ...MATCHER,
+      parseFile: stubParseFile(stubParsed(DELUXE_FILE_TAGS)),
+      fetchReleaseTracklist: mock.fetchReleaseTracklist,
+      settings: { matching: { trackNumberMismatchTolerance: true } }, // tolerance is ON
+    },
+  });
+  // Despite tolerance being ON, the contradicted tracklist disables the patch,
+  // so the file is held for review due to track number mismatch.
+  assert.equal(outcome.decision, POST_DOWNLOAD_DECISIONS.AMBIGUOUS);
+  assert.equal(outcome.blocked, true);
+  assert.match(outcome.reason, /track number mismatch: expected 15, actual 34/i);
+  assert.deepEqual(mock.calls, [DELUXE_RELEASE_MBID], "the contradicted tracklist was fetched");
+});
+
 // --- e. requireExactAlbumMatch hard gate -------------------------------------
 
 ptest("e: requireExactAlbumMatch caps verification at review even when the tracklist would confirm", async () => {
