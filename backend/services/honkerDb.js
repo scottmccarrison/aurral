@@ -121,6 +121,14 @@ export const SCHEDULED_SYSTEM_TASKS = [
     payload: { kind: "sabnzbd-queue-health" },
   },
   {
+    name: "review-timeout-sweep",
+    // MUST stay on "system-task" (flow-owned queue): the sweep mutates
+    // downloadTracker/dedup state that only exists in the flow process.
+    queue: "system-task",
+    schedule: "@every 30m",
+    payload: { kind: "review-timeout-sweep" },
+  },
+  {
     name: "playlist-mbid-enrichment-sweep",
     queue: "playlist-mbid-enrichment",
     schedule: "@every 6h",
