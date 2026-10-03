@@ -19,10 +19,11 @@ import { getPathMappings, resolveLocalPath } from "./pathMappings.js";
 import {
   buildResolvedPlaylistTrack as buildResolvedTrack,
   commitImportToPlaylistLibrary,
+  enrichDownloadedTrack,
   joinUnderRoot,
   sanitizePathPart,
-  writeAudioMetadata,
 } from "./playlistDownloadUtils.js";
+import { resolveCoverArtBytes } from "./coverArtService.js";
 import {
   getPayloadCandidate,
   hasNextCandidate,
@@ -459,7 +460,10 @@ async function handleUsenetFinalize(payload, helpers) {
   const finalDir = joinUnderRoot(playlistRoot, destination);
   const finalName = `${sanitizePathPart(job.trackName, "Unknown Track")}${ext || ".mp3"}`;
   const finalPath = path.join(finalDir, finalName);
-  await writeAudioMetadata(found.filePath, resolvedTrack);
+  // Resolve art before touching the file: the lookup is network-bound and must
+  // never run inside the process-wide commit lock.
+  const cover = await resolveCoverArtBytes(resolvedTrack?.albumMbid).catch(() => null);
+  await enrichDownloadedTrack(found.filePath, finalDir, resolvedTrack, { cover });
   const committedFinalPath = await commitImportToPlaylistLibrary(
     found.filePath,
     finalPath,

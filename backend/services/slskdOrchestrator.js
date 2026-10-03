@@ -43,10 +43,11 @@ import {
 import {
   buildResolvedPlaylistTrack as buildResolvedTrack,
   commitImportToPlaylistLibrary,
+  enrichDownloadedTrack,
   joinUnderRoot,
   sanitizePathPart,
-  writeAudioMetadata,
 } from "./playlistDownloadUtils.js";
+import { resolveCoverArtBytes } from "./coverArtService.js";
 import {
   getPayloadCandidate,
   hasNextCandidate,
@@ -1298,8 +1299,11 @@ async function handleFinalize(payload) {
   }
   const inactiveOwner = deferForInactiveOwner(payload, job);
   if (inactiveOwner) return inactiveOwner;
+  // Resolve art before taking the commit lock: the lock serializes every import
+  // in the process, so a network lookup inside it would stall them all.
+  const cover = await resolveCoverArtBytes(resolvedTrack?.albumMbid).catch(() => null);
   const committed = await withPipelineCommitLock(payload, async () => {
-    await writeAudioMetadata(sourcePath, resolvedTrack);
+    await enrichDownloadedTrack(sourcePath, finalDir, resolvedTrack, { cover });
     import("./aurralHistoryService.js")
       .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
       .catch((err) => { logger.warn("slskd", "Failed to record track job moving", { jobId: job.id, error: err?.message || String(err) }); });

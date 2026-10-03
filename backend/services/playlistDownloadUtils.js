@@ -3,9 +3,35 @@ import { promisify } from "util";
 import path from "path";
 import fs from "fs/promises";
 import { parseFile } from "music-metadata";
+import { dbOps } from "../db/helpers/index.js";
+import { sniffImageMimeType } from "./apiClients/coverArtArchive.js";
+import { logger } from "./logger.js";
 
 const execFileAsync = promisify(execFile);
 const AURRAL_IDENTITY_PREFIX = "AURRAL_IDS=";
+
+// Containers ffmpeg can attach a picture stream to. Anything outside this set is
+// sidecar-only: `-c copy` plus an attached_pic video stream is rejected (ogg/opus
+// have no mapped picture codec, wav/wma have no tag slot ffmpeg will write).
+const EMBEDDABLE_AUDIO_EXTENSIONS = new Set([".mp3", ".flac", ".m4a", ".mp4", ".aac"]);
+const SIDECAR_ONLY_AUDIO_EXTENSIONS = new Set([".ogg", ".oga", ".opus", ".wav", ".wma"]);
+
+// *arr / Navidrome convention: Navidrome sniffs sidecar content, so both names
+// always carry the bytes we were given regardless of jpeg-vs-png.
+const SIDECAR_FILENAMES = ["cover.jpg", "folder.jpg"];
+
+// Art already sitting next to a downloaded file (deemix, slskd folder grabs) is
+// preferred over a network lookup - it is the art that shipped with the source.
+const SOURCE_SIDECAR_FILENAMES = [
+  "cover.jpg",
+  "cover.png",
+  "folder.jpg",
+  "front.jpg",
+  "front.png",
+  "front.jpeg",
+];
+
+const COVER_CODEC_BY_MIME = { "image/jpeg": "mjpeg", "image/png": "png" };
 
 export function sanitizePathPart(value, fallback = "Unknown") {
   const text = String(value || "")
@@ -218,6 +244,291 @@ export async function writeAudioMetadata(filePath, metadata = {}) {
     await fs.rm(taggedPath, { force: true }).catch(() => {});
     const detail = String(error?.stderr || error?.message || error).trim().slice(-500);
     throw new Error(`Failed to write audio metadata: ${detail}`);
+  }
+}
+
+const errorDetail = (error) =>
+  String(error?.stderr || error?.message || error || "").trim().slice(-500);
+
+/**
+ * True when the file already carries an attached picture. Embedding is skipped in
+ * that case (fill-only) so a re-tag never stacks duplicate covers.
+ */
+async function hasEmbeddedPicture(filePath) {
+  try {
+    const { common } = await parseFile(filePath, { skipCovers: false });
+    return Array.isArray(common?.picture) && common.picture.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Attach `bytes` to the audio file as an attached_pic stream, using the same
+ * temp-file + rename + cleanup-on-error convention as writeAudioMetadata.
+ */
+async function embedCoverArt(sourcePath, { bytes, mime }) {
+  const ext = path.extname(sourcePath).toLowerCase();
+  const codec = COVER_CODEC_BY_MIME[mime] || "mjpeg";
+  const stamp = `${process.pid}-${Date.now()}`;
+  const base = path.basename(sourcePath, ext);
+  const coverPath = path.join(
+    path.dirname(sourcePath),
+    `.${base}.${stamp}.cover${codec === "png" ? ".png" : ".jpg"}`,
+  );
+  const embeddedPath = path.join(
+    path.dirname(sourcePath),
+    `.${base}.${stamp}.cover-embedded${ext}`,
+  );
+  await fs.writeFile(coverPath, bytes);
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-nostdin",
+    "-y",
+    "-i",
+    sourcePath,
+    "-i",
+    coverPath,
+    "-map",
+    "0",
+    "-map",
+    "1",
+    "-c",
+    "copy",
+    // The audio source has no video stream, so the attached image is v:0.
+    "-c:v:0",
+    codec,
+    "-disposition:v:0",
+    "attached_pic",
+    "-metadata:s:v:0",
+    "title=Album cover",
+    "-metadata:s:v:0",
+    "comment=Cover (front)",
+  ];
+  if (ext === ".mp3") args.push("-id3v2_version", "3");
+  args.push(embeddedPath);
+  try {
+    await execFileAsync("ffmpeg", args, { timeout: 120000 });
+    await fs.rename(embeddedPath, sourcePath);
+    return true;
+  } catch (error) {
+    await fs.rm(embeddedPath, { force: true }).catch(() => {});
+    throw new Error(`Failed to embed cover art: ${errorDetail(error)}`);
+  } finally {
+    await fs.rm(coverPath, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Embed cover art into an audio file and/or write `cover.jpg` + `folder.jpg`
+ * sidecars next to it.
+ *
+ * Best-effort by contract: cover art must never be able to fail a download, so
+ * failures are logged and surfaced through the return value instead of thrown.
+ * A failed embed still allows the sidecars to be written.
+ *
+ * @param {string} filePath audio file to embed into (normally the staging file)
+ * @param {{bytes: Buffer|Uint8Array, mime?: string|null}} cover
+ * @param {object} [options]
+ * @param {boolean} [options.embed=true] skip for containers ffmpeg cannot attach
+ *   pictures to; the container matrix below decides that, not the caller.
+ * @param {boolean} [options.sidecar=true]
+ * @param {string|null} [options.sidecarDir] defaults to dirname(filePath). Callers
+ *   pass the final library dir because the staging file is moved on commit.
+ * @returns {Promise<{embedded: boolean, sidecarsWritten: string[]}>} absolute paths
+ *   of the sidecars this call created (pre-existing ones are never overwritten).
+ */
+export async function writeAudioCover(
+  filePath,
+  { bytes, mime } = {},
+  { embed = true, sidecar = true, sidecarDir = null } = {},
+) {
+  const result = { embedded: false, sidecarsWritten: [] };
+  const coverBytes = Buffer.isBuffer(bytes)
+    ? bytes
+    : bytes == null
+      ? null
+      : Buffer.from(bytes);
+  if (!coverBytes?.length) return result;
+
+  const sourcePath = path.resolve(filePath);
+  // Sniffed magic bytes win over the declared mime: a tier-2 URL can hand back an
+  // HTML error page, and that must never be embedded or written as cover.jpg.
+  const resolvedMime = sniffImageMimeType(coverBytes);
+  if (!resolvedMime) {
+    logger.warn("cover-art", "Cover art payload is not a jpeg/png image; skipped", {
+      filePath: sourcePath,
+      declaredMime: mime || null,
+    });
+    return result;
+  }
+  const ext = path.extname(sourcePath).toLowerCase();
+
+  if (embed) {
+    if (EMBEDDABLE_AUDIO_EXTENSIONS.has(ext)) {
+      try {
+        if (await hasEmbeddedPicture(sourcePath)) {
+          logger.debug("cover-art", "Audio file already has embedded cover art", {
+            extension: ext,
+          });
+        } else {
+          result.embedded = await embedCoverArt(sourcePath, {
+            bytes: coverBytes,
+            mime: resolvedMime,
+          });
+        }
+      } catch (error) {
+        logger.warn("cover-art", "Cover art embed failed; sidecar only", {
+          filePath: sourcePath,
+          error: errorDetail(error),
+        });
+      }
+    } else if (SIDECAR_ONLY_AUDIO_EXTENSIONS.has(ext)) {
+      logger.debug("cover-art", "Container cannot hold an attached picture", {
+        extension: ext,
+      });
+    }
+  }
+
+  if (sidecar) {
+    const dir = path.resolve(sidecarDir || path.dirname(sourcePath));
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch (error) {
+      logger.warn("cover-art", "Cover art sidecar directory unavailable", {
+        dir,
+        error: errorDetail(error),
+      });
+      return result;
+    }
+    for (const name of SIDECAR_FILENAMES) {
+      const target = path.join(dir, name);
+      try {
+        // Exclusive create: existing art is left alone (fill-only, race-safe).
+        await fs.writeFile(target, coverBytes, { flag: "wx" });
+        result.sidecarsWritten.push(target);
+      } catch (error) {
+        if (error?.code === "EEXIST") continue;
+        logger.warn("cover-art", "Cover art sidecar write failed", {
+          target,
+          error: errorDetail(error),
+        });
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Cover-art enrichment switches. Both default ON when the settings block is
+ * absent, so installs that predate the setting keep getting art.
+ */
+function readCoverArtEnrichmentFlags() {
+  try {
+    const enrichment = dbOps.getSettings?.()?.enrichment;
+    return {
+      embed: enrichment?.embedCoverArt !== false,
+      sidecar: enrichment?.sidecarCoverArt !== false,
+    };
+  } catch {
+    return { embed: true, sidecar: true };
+  }
+}
+
+/**
+ * Tier 0: adopt art that already sits beside the downloaded file (deemix and
+ * folder grabs ship their own cover), before spending a network lookup.
+ */
+async function adoptSourceSidecarCover(stagingPath) {
+  const dir = path.dirname(path.resolve(stagingPath));
+  for (const name of SOURCE_SIDECAR_FILENAMES) {
+    try {
+      const bytes = await fs.readFile(path.join(dir, name));
+      const mime = sniffImageMimeType(bytes);
+      if (mime) return { bytes, mime, source: "source-sidecar" };
+    } catch {
+      // Absent or unreadable - try the next candidate name.
+    }
+  }
+  return null;
+}
+
+async function resolveTrackCover(resolvedTrack, resolveCover) {
+  const mbid = String(resolvedTrack?.albumMbid || "").trim();
+  if (!mbid) return null;
+  if (typeof resolveCover === "function") return (await resolveCover(mbid)) || null;
+  // Lazy: keeps the cover-art client graph (and its network deps) out of modules
+  // that only ever tag files.
+  const { resolveCoverArtBytes } = await import("./coverArtService.js");
+  return (await resolveCoverArtBytes(mbid)) || null;
+}
+
+/**
+ * Tag a downloaded track, then enrich it with cover art: embedded into the audio
+ * file plus `cover.jpg`/`folder.jpg` sidecars in the final library directory.
+ *
+ * Tags are written first and unconditionally - art is optional enrichment and no
+ * art problem (resolve, read, embed or sidecar) may ever fail the download.
+ *
+ * @param {string} stagingPath file to tag and embed into; it is moved to its
+ *   final name by commitImportToPlaylistLibrary afterwards, so embedded art
+ *   travels with it.
+ * @param {string} finalDir library directory the file will be committed into -
+ *   sidecars are written here, not into the staging dir.
+ * @param {object} resolvedTrack tag source (see buildResolvedPlaylistTrack)
+ * @param {object} [options]
+ * @param {{bytes: Buffer, mime?: string, source?: string}|null} [options.cover]
+ *   pre-resolved art; pass it to keep network work outside the commit lock.
+ * @param {((mbid: string) => Promise<{bytes: Buffer, mime?: string}|null>)|null} [options.resolveCover]
+ *   injected resolver, defaults to coverArtService.resolveCoverArtBytes.
+ * @returns {Promise<{embedded: boolean, sidecarsWritten: string[]}|null>}
+ */
+export async function enrichDownloadedTrack(
+  stagingPath,
+  finalDir,
+  resolvedTrack,
+  { cover = null, resolveCover = null } = {},
+) {
+  await writeAudioMetadata(stagingPath, resolvedTrack);
+  try {
+    const { embed, sidecar } = readCoverArtEnrichmentFlags();
+    if (!embed && !sidecar) return null;
+
+    let resolved = null;
+    if (cover == null) {
+      resolved =
+        (await adoptSourceSidecarCover(stagingPath)) ||
+        (await resolveTrackCover(resolvedTrack, resolveCover));
+    } else if (cover?.bytes?.length) {
+      const bytes = Buffer.isBuffer(cover.bytes) ? cover.bytes : Buffer.from(cover.bytes);
+      resolved = {
+        bytes,
+        mime: sniffImageMimeType(bytes) || cover.mime || null,
+        source: cover.source || "caller",
+      };
+    }
+    if (!resolved?.bytes?.length) return null;
+
+    return await writeAudioCover(
+      stagingPath,
+      { bytes: resolved.bytes, mime: resolved.mime },
+      {
+        embed,
+        sidecar,
+        // commitImportToPlaylistLibrary moves only the audio file, so sidecars
+        // must land in the library dir directly.
+        sidecarDir: finalDir ? path.resolve(finalDir) : null,
+      },
+    );
+  } catch (error) {
+    logger.warn("cover-art", "Cover art enrichment skipped", {
+      stagingPath: String(stagingPath || ""),
+      error: errorDetail(error),
+    });
+    return null;
   }
 }
 
