@@ -138,6 +138,32 @@ function normalizeMatchingSettings(raw) {
   };
 }
 
+const ENRICHMENT_DEFAULT_BATCH_LIMIT = 200;
+
+/**
+ * Defaults are applied ON READ, so a partial stored object (or a partial
+ * updateSettings call) can never silently disable a repair feature: a missing
+ * key yields the default, not `undefined`. Enable flags coerce with `!== false`
+ * exactly like normalizeMatchingSettings. Unknown keys survive via the spread.
+ */
+function normalizeEnrichmentSettings(raw) {
+  const enrichment = raw && typeof raw === "object" ? raw : {};
+  const parsedBatchLimit = Number(enrichment.repairBatchLimit);
+  const repairBatchLimit =
+    Number.isFinite(parsedBatchLimit) && parsedBatchLimit > 0
+      ? Math.floor(parsedBatchLimit)
+      : ENRICHMENT_DEFAULT_BATCH_LIMIT;
+  // Preserve unknown enrichment.* keys on round-trip (mirrors matching/sources)
+  return {
+    ...enrichment,
+    embedCoverArt: enrichment.embedCoverArt !== false,
+    sidecarCoverArt: enrichment.sidecarCoverArt !== false,
+    repairSweepEnabled: enrichment.repairSweepEnabled !== false,
+    repairFillMbid: enrichment.repairFillMbid !== false,
+    repairBatchLimit,
+  };
+}
+
 function getOrCreateEncryptionKey() {
   const row = getSettingStmt.get("_encryptionKey");
   if (row?.value) {
@@ -246,6 +272,7 @@ export const dbOps = {
     );
     const sources = normalizeSourceSettings(readStoredSettingJson("sources"));
     const matching = normalizeMatchingSettings(readStoredSettingJson("matching"));
+    const enrichment = normalizeEnrichmentSettings(readStoredSettingJson("enrichment"));
     const inbox = dbHelpers.parseJSON(getSettingStmt.get("inbox")?.value) || {};
     const blocklist = dbHelpers.parseJSON(
       getSettingStmt.get("blocklist")?.value
@@ -290,6 +317,7 @@ export const dbOps = {
       playlistArtwork,
       sources,
       matching,
+      enrichment,
       inbox: {
         enabled: inbox.enabled !== false,
         releases: inbox.releases !== false,
@@ -468,6 +496,12 @@ export const dbOps = {
         upsertSettingStmt.run(
           "matching",
           dbHelpers.stringifyJSON(normalizeMatchingSettings(settings.matching)),
+        );
+      }
+      if (settings.enrichment !== undefined) {
+        upsertSettingStmt.run(
+          "enrichment",
+          dbHelpers.stringifyJSON(normalizeEnrichmentSettings(settings.enrichment)),
         );
       }
       if (settings.blocklist !== undefined) {

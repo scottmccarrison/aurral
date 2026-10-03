@@ -135,6 +135,12 @@ export const SCHEDULED_SYSTEM_TASKS = [
     payload: { kind: "playlist-mbid-enrichment-sweep", reason: "schedule" },
     maxAttempts: 4,
   },
+  {
+    name: "metadata-repair-sweep",
+    queue: "system-task-maintenance",
+    schedule: "@every 6h",
+    payload: { kind: "metadata-repair-sweep" },
+  },
 ];
 
 const PIPELINE_PHASE_PRIORITY = {
@@ -361,7 +367,9 @@ export const getInboxTaskQueue = inboxTask.getQueue;
 export function getSystemTaskQueueName(kind) {
   if (kind === "inbox-refresh") return "system-task-inbox";
   if (kind === "session-cleanup" || kind === "news-refresh" ||
-      kind === "weekly-flow-refresh") return "system-task-maintenance";
+      kind === "weekly-flow-refresh" || kind === "metadata-repair-sweep") {
+    return "system-task-maintenance";
+  }
   return "system-task";
 }
 
