@@ -1,4 +1,5 @@
 import axios from "../../../lib/axiosFetch.js";
+import { UUID_REGEX } from "../../../lib/uuid.js";
 import createRateLimiter from "./rateLimiter.js";
 import createCache from "./simpleCache.js";
 import { dbOps } from "../../db/helpers/index.js";
@@ -198,6 +199,103 @@ export async function musicbrainzGetReleaseTracklist(
     );
     return mapReleaseTracklist(response.data);
   });
+}
+
+/**
+ * Releases a single MusicBrainz RECORDING appears on (`inc=releases`), used by
+ * the metadata repair sweep to resolve an album MBID from a recording MBID the
+ * file already carries. Shares the client rate limiter, caches for the release
+ * group TTL, and never throws: a failed lookup degrades to "no candidates" so
+ * the sweep records the file as unresolved instead of aborting the batch.
+ *
+ * @param {string} recordingMbid a recording MBID (NOT a release MBID)
+ * @returns {Promise<Array<object>>} raw MusicBrainz release objects
+ */
+export async function musicbrainzGetRecordingReleases(
+  recordingMbid,
+  { timeoutMs = 8000, signal } = {},
+) {
+  const mbid = String(recordingMbid || "").trim();
+  if (!UUID_REGEX.test(mbid)) return [];
+  const cacheKey = `recording-releases:${mbid}`;
+  const cached = musicbrainzReleaseGroupsCache.get(cacheKey);
+  if (cached) return cached;
+  const boundedTimeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Number(timeoutMs)
+      : 8000;
+  try {
+    const releases = await mbLimiter.schedule(async () => {
+      signal?.throwIfAborted?.();
+      const response = await axios.get(
+        `${MUSICBRAINZ_API}/recording/${encodeURIComponent(mbid)}`,
+        {
+          params: { fmt: "json", inc: "releases" },
+          headers: { "User-Agent": musicbrainzUserAgent() },
+          timeout: boundedTimeout,
+          signal,
+        },
+      );
+      return Array.isArray(response.data?.releases) ? response.data.releases : [];
+    });
+    musicbrainzReleaseGroupsCache.set(cacheKey, releases);
+    return releases;
+  } catch {
+    return [];
+  }
+}
+
+// Only the two Lucene metacharacters that can break out of a quoted phrase.
+const escapeLucenePhrase = (value) =>
+  String(value || "").trim().replace(/([\\"])/g, "\\$1");
+
+/**
+ * Release-group search used as the metadata repair sweep's fallback when a file
+ * carries no recording MBID. Deliberately broad: recall is the API's job and
+ * the sweep applies the strict exact-name filter itself, so a fuzzy hit here can
+ * never become a written MBID. Never throws - failures degrade to "no
+ * candidates" and the file is counted unresolved.
+ *
+ * @returns {Promise<Array<object>>} raw MusicBrainz release-group objects
+ */
+export async function musicbrainzSearchReleaseGroup(
+  artistName,
+  albumName,
+  { limit = 25, timeoutMs = 8000, signal } = {},
+) {
+  const artist = escapeLucenePhrase(artistName);
+  const album = escapeLucenePhrase(albumName);
+  if (!artist || !album) return [];
+  const cacheKey = `release-group-search:${artist.toLowerCase()}:${album.toLowerCase()}`;
+  const cached = musicbrainzReleaseGroupsCache.get(cacheKey);
+  if (cached) return cached;
+  const safeLimit = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 25));
+  const boundedTimeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Number(timeoutMs)
+      : 8000;
+  try {
+    const groups = await mbLimiter.schedule(async () => {
+      signal?.throwIfAborted?.();
+      const response = await axios.get(`${MUSICBRAINZ_API}/release-group`, {
+        params: {
+          fmt: "json",
+          query: `releasegroup:"${album}" AND artist:"${artist}"`,
+          limit: safeLimit,
+        },
+        headers: { "User-Agent": musicbrainzUserAgent() },
+        timeout: boundedTimeout,
+        signal,
+      });
+      return Array.isArray(response.data?.["release-groups"])
+        ? response.data["release-groups"]
+        : [];
+    });
+    musicbrainzReleaseGroupsCache.set(cacheKey, groups);
+    return groups;
+  } catch {
+    return [];
+  }
 }
 
 const mapAppearsOnReleaseGroup = (releaseGroup, release, recording, mbid) => {

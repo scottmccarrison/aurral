@@ -127,6 +127,10 @@ export async function processSystemTask(payload = {}, job = null) {
       const result = await maintainSabnzbdQueueHealth();
       return result;
     }
+    case "metadata-repair-sweep": {
+      const { repairMetadataGaps } = await import("./metadataRepairService.js");
+      return await repairMetadataGaps();
+    }
     case "review-timeout-sweep": {
       const { enforceReviewTimeouts } = await import("./reviewTimeoutService.js");
       const result = await enforceReviewTimeouts();

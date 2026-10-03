@@ -332,6 +332,8 @@ db.exec(`
     duration_ms INTEGER,
     quality_json TEXT,
     available INTEGER NOT NULL DEFAULT 1,
+    has_embedded_art INTEGER NOT NULL DEFAULT 0,
+    has_sidecar_art INTEGER NOT NULL DEFAULT 0,
     last_seen_scan_id INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -603,6 +605,17 @@ if (hasUniqueIndex(["path"])) {
       ON library_media_files (last_seen_scan_id);
   `);
 }
+
+// Cover-art presence flags backing the metadata repair sweep and the
+// /api/library/metadata-gaps endpoint. Added AFTER the library_media_files_v3
+// rebuild above so a rebuilt database cannot drop them again; tryAddColumn
+// swallows "duplicate column name" so this is idempotent on existing DBs.
+tryAddColumn(
+  "ALTER TABLE library_media_files ADD COLUMN has_embedded_art INTEGER NOT NULL DEFAULT 0",
+);
+tryAddColumn(
+  "ALTER TABLE library_media_files ADD COLUMN has_sidecar_art INTEGER NOT NULL DEFAULT 0",
+);
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_library_artists_provider_id

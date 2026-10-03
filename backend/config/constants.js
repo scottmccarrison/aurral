@@ -199,5 +199,15 @@ export const defaultData = {
       // Example custom order: ["deemix", "slskd", "usenet", "ytdlp"]
       preferredOrder: [],
     },
+    enrichment: {
+      // Library metadata repair sweep (issue #14). All fill-only: a repair
+      // never overwrites a non-empty tag, never renames or moves a file, and
+      // never writes a fuzzy-matched MBID.
+      embedCoverArt: true,          // embed resolved cover bytes into files missing art
+      sidecarCoverArt: true,        // write cover.jpg/folder.jpg next to files missing art
+      repairSweepEnabled: true,     // kill switch for the scheduled sweep
+      repairFillMbid: true,         // allow strict-match album MBID fills
+      repairBatchLimit: 200,        // gap rows per run; 0/negative falls back to 200
+    },
   },
 };
