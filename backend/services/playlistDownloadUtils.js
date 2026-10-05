@@ -1,5 +1,6 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs/promises";
 import { parseFile } from "music-metadata";
@@ -18,6 +19,9 @@ const SIDECAR_ONLY_AUDIO_EXTENSIONS = new Set([".ogg", ".oga", ".opus", ".wav", 
 
 // *arr / Navidrome convention: Navidrome sniffs sidecar content, so both names
 // always carry the bytes we were given regardless of jpeg-vs-png.
+// Order matters: Navidrome's CoverArtPriority prefers `cover.*` over
+// `folder.*`, so cover.jpg is written FIRST - if the second write fails, the
+// surviving file is the higher-priority one.
 const SIDECAR_FILENAMES = ["cover.jpg", "folder.jpg"];
 
 // Art already sitting next to a downloaded file (deemix, slskd folder grabs) is
@@ -32,6 +36,17 @@ const SOURCE_SIDECAR_FILENAMES = [
 ];
 
 const COVER_CODEC_BY_MIME = { "image/jpeg": "mjpeg", "image/png": "png" };
+
+// Sidecar cover candidates larger than this are skipped without being read.
+// Mirrors the CAA client's 15MB download cap.
+const MAX_SIDECAR_COVER_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Temp-file name stamp. pid + millisecond clock alone can collide when two
+ * writes start in the same process within the same millisecond, so a short
+ * random segment is appended.
+ */
+const tempStamp = () => `${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
 export function sanitizePathPart(value, fallback = "Unknown") {
   const text = String(value || "")
@@ -183,7 +198,7 @@ export async function commitImportToPlaylistLibrary(
     if (error?.code !== "EXDEV") throw error;
     const tempTarget = path.join(
       path.dirname(resolvedTarget),
-      `.aurral-import-${process.pid}-${Date.now()}-${path.basename(resolvedTarget)}.tmp`,
+      `.aurral-import-${tempStamp()}-${path.basename(resolvedTarget)}.tmp`,
     );
     await fs.copyFile(sourcePath, tempTarget);
     const [sourceStat, tempStat] = await Promise.all([fs.stat(sourcePath), fs.stat(tempTarget)]);
@@ -202,7 +217,7 @@ export async function writeAudioMetadata(filePath, metadata = {}) {
   const ext = path.extname(sourcePath) || ".m4a";
   const taggedPath = path.join(
     path.dirname(sourcePath),
-    `.${path.basename(sourcePath, ext)}.${process.pid}-${Date.now()}.tagged${ext}`,
+    `.${path.basename(sourcePath, ext)}.${tempStamp()}.tagged${ext}`,
   );
   const tags = [
     ["title", metadata.trackName],
@@ -238,6 +253,11 @@ export async function writeAudioMetadata(filePath, metadata = {}) {
   args.push(taggedPath);
   try {
     await execFileAsync("ffmpeg", args, { timeout: 120000 });
+    // Data-loss guard: an empty (or missing) output must never replace the
+    // original. Thrown inside the try so the existing temp cleanup runs and
+    // the error keeps this function's message shape.
+    const tagged = await fs.stat(taggedPath).catch(() => null);
+    if (!tagged || tagged.size === 0) throw new Error("ffmpeg produced empty output");
     await fs.rename(taggedPath, sourcePath);
     return sourcePath;
   } catch (error) {
@@ -270,7 +290,7 @@ async function hasEmbeddedPicture(filePath) {
 async function embedCoverArt(sourcePath, { bytes, mime }) {
   const ext = path.extname(sourcePath).toLowerCase();
   const codec = COVER_CODEC_BY_MIME[mime] || "mjpeg";
-  const stamp = `${process.pid}-${Date.now()}`;
+  const stamp = tempStamp();
   const base = path.basename(sourcePath, ext);
   const coverPath = path.join(
     path.dirname(sourcePath),
@@ -311,6 +331,11 @@ async function embedCoverArt(sourcePath, { bytes, mime }) {
   args.push(embeddedPath);
   try {
     await execFileAsync("ffmpeg", args, { timeout: 120000 });
+    // Data-loss guard: an empty (or missing) output must never replace the
+    // original. Thrown inside the try so the existing temp cleanup runs and
+    // the error keeps this function's message shape.
+    const embedded = await fs.stat(embeddedPath).catch(() => null);
+    if (!embedded || embedded.size === 0) throw new Error("ffmpeg produced empty output");
     await fs.rename(embeddedPath, sourcePath);
     return true;
   } catch (error) {
@@ -446,7 +471,13 @@ async function adoptSourceSidecarCover(stagingPath) {
   const dir = path.dirname(path.resolve(stagingPath));
   for (const name of SOURCE_SIDECAR_FILENAMES) {
     try {
-      const bytes = await fs.readFile(path.join(dir, name));
+      const candidate = path.join(dir, name);
+      // Size gate BEFORE reading: a zero-byte placeholder is not art and an
+      // oversized file is corrupt or hostile - neither may reach ffmpeg, the
+      // embed path or a sidecar write.
+      const stat = await fs.stat(candidate).catch(() => null);
+      if (!stat?.isFile() || stat.size === 0 || stat.size > MAX_SIDECAR_COVER_BYTES) continue;
+      const bytes = await fs.readFile(candidate);
       const mime = sniffImageMimeType(bytes);
       if (mime) return { bytes, mime, source: "source-sidecar" };
     } catch {

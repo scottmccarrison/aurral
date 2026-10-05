@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { randomUUID } from "crypto";
 import { parseFile } from "music-metadata";
 import { dbOps } from "../db/helpers/index.js";
 import {
@@ -33,6 +34,17 @@ const SIDECAR_ART_TARGETS = ["cover.jpg", "folder.jpg"];
 // COVER_CODEC_BY_MIME so the fallback embedder and the shared `writeAudioCover`
 // produce identical attached-picture streams.
 const COVER_CODEC_BY_MIME = { "image/jpeg": "mjpeg", "image/png": "png" };
+
+// Cover payloads larger than this are rejected before they reach ffmpeg or
+// disk. Mirrors the CAA client's 15MB download cap.
+const MAX_COVER_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Temp-file name stamp. pid + millisecond clock alone can collide when two
+ * writes start in the same process within the same millisecond, so a short
+ * random segment is appended.
+ */
+const tempStamp = () => `${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
 const text = (value) => String(value ?? "").trim();
 
@@ -152,8 +164,15 @@ export async function resolveStrictAlbumMbid(target = {}, {
 // does not own.
 const FILLABLE_TAGS = {
   musicbrainz_albumid: (common, identity) => common.musicbrainz_albumid || identity.albumMbid,
+  // The AURRAL_IDS `albumMbid` is release-GROUP level, but it is the job's
+  // identity, not this tag's value: the repair path resolves a distinct
+  // releaseGroupMbid, so only the file's own tag (or an explicitly recorded
+  // identity releaseGroupMbid) proves the group id is present. Falling back to
+  // identity.albumMbid here would report a genuinely missing tag as filled,
+  // the sweep would never write it, and the row would be stuck as a permanent
+  // gap (the store reconcile reads the tag, not the identity).
   musicbrainz_releasegroupid: (common, identity) =>
-    common.musicbrainz_releasegroupid || identity.albumMbid,
+    common.musicbrainz_releasegroupid || identity.releaseGroupMbid,
   musicbrainz_recordingid: (common, identity) => common.musicbrainz_recordingid || identity.trackMbid,
   musicbrainz_trackid: (common, identity) => common.musicbrainz_trackid || identity.trackMbid,
   musicbrainz_artistid: (common, identity) => common.musicbrainz_artistid || identity.artistMbid,
@@ -189,7 +208,7 @@ async function writeTagsAtomic(filePath, tags) {
   const ext = path.extname(sourcePath) || ".m4a";
   const taggedPath = path.join(
     path.dirname(sourcePath),
-    `.${path.basename(sourcePath, ext)}.${process.pid}-${Date.now()}.tagged${ext}`,
+    `.${path.basename(sourcePath, ext)}.${tempStamp()}.tagged${ext}`,
   );
   const args = [
     "-hide_banner",
@@ -208,6 +227,11 @@ async function writeTagsAtomic(filePath, tags) {
   args.push(taggedPath);
   try {
     await execFileAsync("ffmpeg", args, { timeout: 120000 });
+    // Data-loss guard: an empty (or missing) output must never replace the
+    // original. Thrown inside the try so the existing temp cleanup runs and
+    // the error keeps this function's message shape.
+    const tagged = await fs.stat(taggedPath).catch(() => null);
+    if (!tagged || tagged.size === 0) throw new Error("ffmpeg produced empty output");
     await fs.rename(taggedPath, sourcePath);
     return sourcePath;
   } catch (error) {
@@ -250,7 +274,7 @@ async function embedCoverArtWithFfmpeg(filePath, bytes, { mimeType = "image/jpeg
   const sourcePath = path.resolve(filePath);
   const ext = path.extname(sourcePath) || ".m4a";
   const dir = path.dirname(sourcePath);
-  const stamp = `${process.pid}-${Date.now()}`;
+  const stamp = tempStamp();
   // Sniffed magic bytes win over the declared mime, exactly as in
   // writeAudioCover: a resolver can mislabel a payload, and the codec below has
   // to match what ffmpeg is really being fed.
@@ -294,6 +318,11 @@ async function embedCoverArtWithFfmpeg(filePath, bytes, { mimeType = "image/jpeg
       ],
       { timeout: 120000 },
     );
+    // Data-loss guard: an empty (or missing) output must never replace the
+    // original. Thrown inside the try so the existing temp cleanup runs and
+    // the error keeps this function's message shape.
+    const embedded = await fs.stat(taggedPath).catch(() => null);
+    if (!embedded || embedded.size === 0) throw new Error("ffmpeg produced empty output");
     await fs.rename(taggedPath, sourcePath);
     return true;
   } catch (error) {
@@ -354,10 +383,14 @@ async function resolveCoverBytes(resolver, target) {
   try {
     const resolved = await resolver(target);
     if (!resolved) return null;
-    if (Buffer.isBuffer(resolved)) return { buffer: resolved, mimeType: "image/jpeg" };
+    if (Buffer.isBuffer(resolved)) {
+      // Size cap: an oversized payload is a broken resolver, not cover art.
+      if (resolved.length > MAX_COVER_BYTES) return null;
+      return { buffer: resolved, mimeType: "image/jpeg" };
+    }
     const raw = resolved.bytes ?? resolved.buffer ?? resolved.data;
     const buffer = Buffer.isBuffer(raw) ? raw : raw ? Buffer.from(raw) : null;
-    if (!buffer || buffer.length === 0) return null;
+    if (!buffer || buffer.length === 0 || buffer.length > MAX_COVER_BYTES) return null;
     return { buffer, mimeType: text(resolved.mimeType || resolved.contentType) || "image/jpeg" };
   } catch {
     return null;

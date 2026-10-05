@@ -21,6 +21,7 @@ const [
     getLibraryMediaFile,
     getLibraryMetadataGapCounts,
     linkLibraryAlbumTrack,
+    selectLibraryMetadataGapRows,
     upsertLibraryAlbum,
     upsertLibraryArtist,
     upsertLibraryMediaFile,
@@ -32,7 +33,7 @@ const [
     metadataHasPicture,
     scanMusicRoot,
   },
-  { repairMetadataGaps, resolveStrictAlbumMbid },
+  { repairMetadataGaps, resolveStrictAlbumMbid, writeMissingTags },
   { SCHEDULED_SYSTEM_TASKS, getSystemTaskQueueName },
   { processSystemTask },
   { registerMetadataGaps },
@@ -253,6 +254,22 @@ async function snapshot(files, dirs) {
     state.push({ dir, names: (await fs.readdir(dir)).sort() });
   }
   return state;
+}
+
+/**
+ * Scalar native tags keyed by frame id, across every native container section
+ * (ID3v2.x, vorbis). Picture blocks carry object values and are compared
+ * byte-wise through common.picture instead.
+ */
+function nativeScalarTags(metadata) {
+  const map = new Map();
+  for (const tags of Object.values(metadata?.native || {})) {
+    for (const { id, value } of tags || []) {
+      if (value && typeof value === "object") continue;
+      map.set(id, String(value));
+    }
+  }
+  return map;
 }
 
 const gapsRoute = (() => {
@@ -620,6 +637,70 @@ test("MBID fill: an existing album MBID is never rewritten, even with a stale st
 });
 
 // ---------------------------------------------------------------------------
+// 2b. Gap predicate - orphan media rows
+// ---------------------------------------------------------------------------
+
+test("gap predicate: orphan media rows (NULL album_id) are never selected", async () => {
+  // A normal gap row so the selection set is non-empty and the orphan's
+  // exclusion is provable against a row that IS returned.
+  const { filePath: normalPath } = await seedMbidGapFile();
+
+  // Register an orphan WITHOUT an album link: album_id stays NULL, so the
+  // LEFT JOIN yields album.mbid IS NULL. Before the fix this row matched the
+  // predicate forever - fillLibraryAlbumMbids keys off album.id and can never
+  // fill a NULL album_id - starving the fixed per-run batch budget.
+  const root = await nextLibraryRoot();
+  const orphanPath = path.join(root, "01 Orphan.flac");
+  await makeAudioFile(orphanPath, {
+    tags: { title: "Orphan", artist: "Orphan Artist", album: "Orphan Album" },
+  });
+  const track = upsertLibraryTrack({
+    identityKey: "name:track:orphan",
+    title: "Orphan",
+    artistName: "Orphan Artist",
+  });
+  upsertLibraryMediaFile({
+    trackId: track.id,
+    albumId: null,
+    source: "aurral",
+    path: orphanPath,
+    format: "flac",
+    size: 1,
+    mtimeMs: 1,
+    scanId: 0,
+  });
+  assert.equal(
+    getLibraryMediaFile({ source: "aurral", path: orphanPath }).album_id,
+    null,
+    "fixture must really carry a NULL album_id",
+  );
+
+  assert.equal(
+    getLibraryMetadataGapCounts().total,
+    1,
+    "the orphan row must not join the gap counts (only the normal row does)",
+  );
+  assert.deepEqual(
+    selectLibraryMetadataGapRows({ limit: 10 }).map((row) => row.path),
+    [normalPath],
+    "the orphan row must never be selected",
+  );
+
+  const metrics = await repairMetadataGaps({
+    resolveCover: async () => null,
+    resolveAlbumMbid: async () => null,
+  });
+  assert.equal(metrics.filesScanned, 1, "the sweep must never visit the orphan row");
+
+  const { body } = await callGaps({ limit: "10", offset: "0" });
+  assert.deepEqual(
+    body.items.map((item) => item.path),
+    [normalPath],
+    "the gaps endpoint must not list the orphan row",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 3. Cover-art fill
 // ---------------------------------------------------------------------------
 
@@ -779,6 +860,168 @@ test("merge-only: existing tags and embedded art survive a repair write", async 
     true,
     "a tag write must not drop the embedded picture",
   );
+});
+
+// ---------------------------------------------------------------------------
+// 4b. Tag preservation across the ffmpeg rewrite (data-loss proof)
+// ---------------------------------------------------------------------------
+
+test("tag preservation: custom tags and embedded pictures survive a writeTagsAtomic rewrite", async () => {
+  for (const format of ["mp3", "flac"]) {
+    const root = await nextLibraryRoot();
+    const filePath = path.join(root, `legacy.${format}`);
+    // Legacy-library fixture: non-whitelisted custom tags (genre/comment/
+    // lyrics-style) plus an embedded picture - exactly what a repair rewrite
+    // of an old file must not destroy.
+    await makeAudioFile(filePath, {
+      format,
+      art: true,
+      tags: {
+        title: "Legacy Title",
+        genre: "Punk",
+        comment: "legacy rip comment",
+        lyrics: "legacy lyrics line",
+      },
+    });
+    const before = await parseFile(filePath, { skipCovers: false });
+    assert.deepEqual(before.common.genre, ["Punk"], `${format}: fixture must carry the custom genre`);
+    assert.equal(before.common.picture?.length, 1, `${format}: fixture must carry an embedded picture`);
+    const beforeTags = nativeScalarTags(before);
+    assert.ok(beforeTags.size >= 4, `${format}: fixture must carry the custom tags`);
+
+    const result = await writeMissingTags(filePath, { musicbrainz_albumid: RELEASE_MBID });
+    assert.equal(result.written, true, format);
+    assert.deepEqual(result.applied, { musicbrainz_albumid: RELEASE_MBID }, format);
+
+    const after = await parseFile(filePath, { skipCovers: false });
+    // Every scalar native tag present before the rewrite survives with its
+    // exact value (mp3: TCON / TXXX:comment / TXXX:USLT; flac: GENRE /
+    // DESCRIPTION / LYRICS).
+    const afterTags = nativeScalarTags(after);
+    for (const [id, value] of beforeTags) {
+      assert.equal(afterTags.get(id), value, `${format}: native tag ${id} must survive the rewrite`);
+    }
+    assert.deepEqual(after.common.genre, ["Punk"], `${format}: genre must survive`);
+    assert.equal(after.common.picture?.length, 1, `${format}: the embedded picture must survive`);
+    assert.deepEqual(
+      Buffer.from(after.common.picture[0].data),
+      Buffer.from(before.common.picture[0].data),
+      `${format}: picture bytes must be identical`,
+    );
+    // Proof the rewrite really happened: flac maps the new key onto common;
+    // mp3 keeps it as a TXXX frame whose lowercase description
+    // music-metadata does not map (documented ffmpeg/mp3 quirk), so it is
+    // asserted at the native level instead.
+    if (format === "flac") {
+      assert.equal(after.common.musicbrainz_albumid, RELEASE_MBID, format);
+    } else {
+      assert.equal(afterTags.get("TXXX:musicbrainz_albumid"), RELEASE_MBID, format);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4c. FILLABLE_TAGS identity-conflation regression
+// ---------------------------------------------------------------------------
+
+test("FILLABLE_TAGS: an AURRAL_IDS identity never masks a missing release-group tag", async () => {
+  const root = await nextLibraryRoot();
+  const dir = path.join(root, "Ramones", "Animal Boy");
+  const filePath = path.join(dir, "01 Some Track.flac");
+  // The identity's albumMbid is release-GROUP level, but it is the job's
+  // identity - not proof that the musicbrainz_releasegroupid TAG exists. The
+  // pre-fix reader fell back to identity.albumMbid, reported the tag as
+  // filled, and the row became a permanent gap: the sweep never wrote the tag
+  // and the store reconcile (which reads tags, not identity) never filled it.
+  const identity = `AURRAL_IDS=${JSON.stringify({
+    artistMbid: "11111111-1111-4111-8111-111111111111",
+    albumMbid: RELEASE_GROUP_MBID,
+  })}`;
+  await makeArtCompleteFile(filePath, {
+    title: "Some Track",
+    artist: "Ramones",
+    album: "Animal Boy",
+    musicbrainz_albumid: RELEASE_MBID,
+    grouping: identity,
+  });
+  await scanMusicRoot({ rootPath: root, source: "aurral" });
+  // The scanner applies its own identity fallback when it populates the store,
+  // so force the stale-store case: release_group_mbid is NULL while the FILE
+  // carries only the identity - exactly the state where the pre-fix
+  // FILLABLE_TAGS reader conflated identity.albumMbid with the missing tag.
+  db.prepare("UPDATE library_albums SET release_group_mbid = NULL").run();
+  assert.equal(
+    getLibraryMetadataGapCounts().missingMbid,
+    1,
+    "release_group_mbid is NULL in the store while the file lacks the tag",
+  );
+
+  const metrics = await repairMetadataGaps({
+    resolveCover: async () => null,
+    resolveAlbumMbid: async () => ({
+      albumMbid: RELEASE_MBID,
+      releaseGroupMbid: RELEASE_GROUP_MBID,
+      via: "test",
+    }),
+  });
+
+  assert.equal(
+    metrics.mbidsFilled,
+    1,
+    "the missing release-group tag must be written, not masked by the identity",
+  );
+  const { common } = await parseFile(filePath, { skipCovers: true });
+  assert.equal(common.musicbrainz_releasegroupid, RELEASE_GROUP_MBID);
+  assert.equal(common.musicbrainz_albumid, RELEASE_MBID, "the existing tag must be untouched");
+  assert.equal(common.grouping, identity, "the identity comment must survive the rewrite");
+  assert.deepEqual(getLibraryMetadataGapCounts(), { missingArt: 0, missingMbid: 0, total: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// 4d. Empty-output guard (data-loss protection)
+// ---------------------------------------------------------------------------
+
+test("empty-output guard: a zero-byte or missing ffmpeg output never replaces the original", async () => {
+  const root = await nextLibraryRoot();
+  const filePath = path.join(root, "guarded.flac");
+  await makeAudioFile(filePath, {
+    tags: { title: "Guarded", artist: "Guard Artist", album: "Guard Album" },
+  });
+  const before = await snapshot([filePath], [root]);
+
+  // PATH shims that exit 0 like a successful ffmpeg but produce (a) a
+  // zero-byte output file or (b) no output file at all - exactly the two
+  // states the guard between execFileAsync and fs.rename exists for.
+  const shimRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aurral-ffmpeg-shim-"));
+  const shims = {
+    "zero-byte": '#!/bin/sh\nfor last in "$@"; do :; done\n: > "$last"\nexit 0\n',
+    missing: "#!/bin/sh\nexit 0\n",
+  };
+  const originalPath = process.env.PATH;
+  try {
+    for (const [name, script] of Object.entries(shims)) {
+      const shimDir = path.join(shimRoot, name);
+      await fs.mkdir(shimDir, { recursive: true });
+      await fs.writeFile(path.join(shimDir, "ffmpeg"), script, { mode: 0o755 });
+      process.env.PATH = `${shimDir}${path.delimiter}${originalPath}`;
+      await assert.rejects(
+        writeMissingTags(filePath, { musicbrainz_albumid: RELEASE_MBID }),
+        /ffmpeg produced empty output/,
+        `${name}: the guard must refuse to rename a non-viable output`,
+      );
+    }
+  } finally {
+    process.env.PATH = originalPath;
+    await fs.rm(shimRoot, { recursive: true, force: true });
+  }
+
+  assert.deepEqual(
+    await snapshot([filePath], [root]),
+    before,
+    "the original must be byte-identical and no temp file may leak",
+  );
+  const { common } = await parseFile(filePath, { skipCovers: true });
+  assert.equal(common.musicbrainz_albumid, undefined, "nothing may have been written");
 });
 
 // ---------------------------------------------------------------------------

@@ -647,12 +647,19 @@ export function getLibraryMediaFile({ source, path }) {
 // to library_albums.release_group_mbid), never on library_media_files. The
 // sweep fills BOTH tags, so the predicate requires BOTH: a row that only ever
 // resolves to a release group would otherwise be re-selected on every run.
+//
+// media.album_id IS NOT NULL is required: an orphan media row (no album link)
+// satisfies `album.mbid IS NULL` through the LEFT JOIN, but fillLibraryAlbumMbids
+// keys off album.id and can never fill a NULL album_id. Without this guard the
+// row is a permanent gap - re-selected on every run and starving the fixed
+// per-run batch budget (issue #14).
 // ---------------------------------------------------------------------------
 const METADATA_GAP_FROM = `
   FROM library_media_files AS media
   LEFT JOIN library_albums AS album ON album.id = media.album_id
   LEFT JOIN library_artists AS artist ON artist.id = album.artist_id
   WHERE media.available = 1
+    AND media.album_id IS NOT NULL
     AND (
       media.has_embedded_art = 0
       OR media.has_sidecar_art = 0

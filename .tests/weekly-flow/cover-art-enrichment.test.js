@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseFile } from "music-metadata";
@@ -11,8 +11,9 @@ import { dbOps } from "../../backend/db/helpers/index.js";
 import {
   enrichDownloadedTrack,
   writeAudioCover,
+  writeAudioMetadata,
 } from "../../backend/services/playlistDownloadUtils.js";
-import { resolveCoverArtBytes } from "../../backend/services/coverArtService.js";
+import { inFlightCoverFetches, resolveCoverArtBytes } from "../../backend/services/coverArtService.js";
 import {
   caaImageCache,
   fetchCoverArtArchiveFront,
@@ -342,6 +343,40 @@ test("prefers Cover Art Archive and falls back to the URL chain", async () => {
   assert.equal(tierCalls, 0, "a missing MBID must return immediately");
 });
 
+test("concurrent resolves for one mbid share a single fetch (singleflight)", async () => {
+  const mbid = "aaaaaaaa-0000-4000-8000-0000000000f1";
+  let caaCalls = 0;
+  // Each caller injects its OWN fake deps; only the first caller's fetcher may
+  // run - the second must join the in-flight promise instead of re-fetching.
+  const fakeDeps = () => ({
+    fetchCaa: async () => {
+      caaCalls += 1;
+      // Hold the fetch open so both callers are provably concurrent.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { bytes: jpegBytes, mime: "image/jpeg", notFound: false, transientError: false };
+    },
+    resolveUrl: async () => ({ imageUrl: null, notFound: true, transientError: false }),
+    fetchBytes: async () => null,
+  });
+
+  const [first, second] = await Promise.all([
+    resolveCoverArtBytes(mbid, fakeDeps()),
+    resolveCoverArtBytes(mbid, fakeDeps()),
+  ]);
+
+  assert.equal(caaCalls, 1, "the in-flight promise must be shared, not re-fetched");
+  assert.equal(first.source, "caa");
+  assert.equal(first, second, "both callers receive the identical result object");
+  assert.equal(inFlightCoverFetches.size, 0, "the in-flight entry is cleared once settled");
+
+  // Injected fakes are never TTL-cached: a later sequential call fetches again
+  // (proves the finally-cleanup did not leave a stale entry behind).
+  const third = await resolveCoverArtBytes(mbid, fakeDeps());
+  assert.equal(caaCalls, 2, "a settled fetch must not stay pinned in the map");
+  assert.deepEqual(third, first);
+  assert.equal(inFlightCoverFetches.size, 0);
+});
+
 test("writes tags and no sidecars when every art tier fails", async () => {
   const { stagingPath, finalDir } = await createCase("no-art", "mp3");
 
@@ -554,6 +589,92 @@ test("fetchCoverArtArchiveFront validates payloads and caches outcomes", async (
     transientError: false,
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. Tag preservation across a metadata rewrite (data-loss proof)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scalar native tags keyed by frame id, across every native container section
+ * (ID3v2.x, vorbis). Picture blocks carry object values and are compared
+ * byte-wise through common.picture instead.
+ */
+function nativeScalarTags(metadata) {
+  const map = new Map();
+  for (const tags of Object.values(metadata?.native || {})) {
+    for (const { id, value } of tags || []) {
+      if (value && typeof value === "object") continue;
+      map.set(id, String(value));
+    }
+  }
+  return map;
+}
+
+const pngFixturePath = path.join(tempDir, "fixture-blue.png");
+
+for (const format of ["mp3", "flac"]) {
+  test(`writeAudioMetadata preserves legacy tags and embedded pictures (${format})`, async () => {
+    const { stagingDir, stagingPath } = await createCase(`tag-preservation-${format}`, format);
+    // Legacy-library fixture: non-whitelisted custom tags (genre/comment/
+    // lyrics-style) plus an embedded picture - exactly what a re-tag of an
+    // old file must not destroy.
+    const legacyPath = path.join(stagingDir, `legacy.${format}`);
+    runFfmpeg([
+      "-i", stagingPath, "-map", "0", "-c", "copy",
+      "-metadata", "genre=Punk",
+      "-metadata", "comment=legacy rip comment",
+      "-metadata", "lyrics=legacy lyrics line",
+      legacyPath,
+    ]);
+    const artPath = path.join(stagingDir, `art.${format}`);
+    runFfmpeg([
+      "-i", legacyPath, "-i", pngFixturePath,
+      "-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "copy",
+      "-disposition:v", "attached_pic",
+      artPath,
+    ]);
+    await rename(artPath, stagingPath);
+    await rm(legacyPath, { force: true });
+
+    const before = await parseFile(stagingPath, { skipCovers: false });
+    assert.deepEqual(before.common.genre, ["Punk"], "fixture must carry the custom genre");
+    assert.equal(before.common.picture?.length, 1, "fixture must carry an embedded picture");
+    const beforeTags = nativeScalarTags(before);
+    assert.ok(beforeTags.size >= 4, "fixture must carry the custom tags");
+
+    // The rewrite under test: one MBID-ish key set, written through the real
+    // ffmpeg `-map 0 -c copy` + `-metadata` path.
+    await writeAudioMetadata(stagingPath, { albumMbid: TRACK.albumMbid });
+
+    const after = await parseFile(stagingPath, { skipCovers: false });
+    // Every scalar native tag present before the rewrite survives with its
+    // exact value (mp3: TCON / TXXX:comment / TXXX:USLT; flac: GENRE /
+    // DESCRIPTION / LYRICS).
+    const afterTags = nativeScalarTags(after);
+    for (const [id, value] of beforeTags) {
+      assert.equal(afterTags.get(id), value, `native tag ${id} must survive the rewrite`);
+    }
+    assert.deepEqual(after.common.genre, ["Punk"], "genre must survive");
+    assert.equal(after.common.picture?.length, 1, "the embedded picture must survive");
+    assert.equal(after.common.picture[0].format, "image/png");
+    assert.deepEqual(
+      Buffer.from(after.common.picture[0].data),
+      Buffer.from(before.common.picture[0].data),
+      "picture bytes must be identical",
+    );
+    // Proof the rewrite really happened: flac maps the new keys onto common;
+    // mp3 keeps them as TXXX frames whose lowercase descriptions
+    // music-metadata does not map (documented ffmpeg/mp3 quirk), so they are
+    // asserted at the native level instead.
+    if (format === "flac") {
+      assert.equal(after.common.musicbrainz_albumid, TRACK.albumMbid);
+      assert.equal(after.common.musicbrainz_releasegroupid, TRACK.albumMbid);
+    } else {
+      assert.equal(afterTags.get("TXXX:musicbrainz_albumid"), TRACK.albumMbid);
+      assert.equal(afterTags.get("TXXX:musicbrainz_releasegroupid"), TRACK.albumMbid);
+    }
+  });
+}
 
 test.after(async () => {
   await rm(tempDir, { recursive: true, force: true });

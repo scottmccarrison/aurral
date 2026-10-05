@@ -14,6 +14,17 @@ import { logger } from "./logger.js";
  */
 const resolvedCoverCache = createCache(3600);
 
+/**
+ * In-flight fetches keyed by mbid (singleflight). When N parallel tracks of the
+ * same album resolve the same mbid before the first fetch completes, every
+ * caller past the first would otherwise hit the network too - 10 duplicate
+ * fetches for a 10-track album, and concurrent sidecar writers racing on
+ * possibly mixed payloads. The promise is stored BEFORE its first await and
+ * deleted in `finally`, so the map only ever dedupes concurrent calls and can
+ * never grow past the number of in-flight fetches.
+ */
+const inFlightCoverFetches = new Map();
+
 const defaultResolveUrl = fetchReleaseGroupCoverUrl;
 
 /**
@@ -40,6 +51,44 @@ const normalizeFetchedBytes = (fetched) => {
 };
 
 /**
+ * Run the tier chain for one mbid and (when cacheable) memoize the winner.
+ * Extracted so `resolveCoverArtBytes` can wrap it in the singleflight map.
+ * Never rejects: every failure is caught and surfaced as `null`.
+ */
+async function fetchCoverArtBytes(
+  mbid,
+  { resolveUrl, fetchBytes, fetchCaa, logTag, signal },
+  cacheable,
+) {
+  try {
+    const caa = await fetchCaa(mbid, { signal });
+    const caaArt = normalizeFetchedBytes(caa);
+    if (caaArt) {
+      const result = { ...caaArt, source: "caa" };
+      if (cacheable) resolvedCoverCache.set(mbid, result);
+      return result;
+    }
+
+    const resolved = await resolveUrl(mbid);
+    const imageUrl =
+      typeof resolved === "string" ? resolved : String(resolved?.imageUrl || "").trim();
+    if (!imageUrl) return null;
+
+    const urlArt = normalizeFetchedBytes(await fetchBytes(imageUrl));
+    if (!urlArt) return null;
+    const result = { ...urlArt, source: "url-chain" };
+    if (cacheable) resolvedCoverCache.set(mbid, result);
+    return result;
+  } catch (error) {
+    logger.warn(logTag, "Cover art resolution failed", {
+      mbid,
+      error: error?.message || String(error),
+    });
+    return null;
+  }
+}
+
+/**
  * Resolve cover art bytes for a MusicBrainz release group.
  *
  * Tier order:
@@ -50,6 +99,12 @@ const normalizeFetchedBytes = (fetched) => {
  *
  * Never throws: cover art is best-effort enrichment and must not be able to fail
  * a download. All network access is injectable so tests stay offline.
+ *
+ * Concurrent calls for the same mbid are deduped through an in-flight promise
+ * map (singleflight): the whole album's tracks resolving at once trigger ONE
+ * network fetch, and every concurrent caller receives the same result object.
+ * The TTL cache is unchanged - it still only memoizes when the real clients are
+ * in play, so injected fakes are never swallowed.
  *
  * @param {string} releaseGroupMbid
  * @param {object} [options]
@@ -84,32 +139,22 @@ export async function resolveCoverArtBytes(
     if (cached?.bytes?.length) return cached;
   }
 
-  try {
-    const caa = await fetchCaa(mbid, { signal });
-    const caaArt = normalizeFetchedBytes(caa);
-    if (caaArt) {
-      const result = { ...caaArt, source: "caa" };
-      if (cacheable) resolvedCoverCache.set(mbid, result);
-      return result;
-    }
+  // Singleflight: a second concurrent caller for the same mbid joins the
+  // in-flight promise instead of starting a duplicate fetch. The entry is
+  // stored synchronously (before the impl's first await) and removed once the
+  // promise settles, so it never outlives the fetch it tracks.
+  const inFlight = inFlightCoverFetches.get(mbid);
+  if (inFlight) return inFlight;
 
-    const resolved = await resolveUrl(mbid);
-    const imageUrl =
-      typeof resolved === "string" ? resolved : String(resolved?.imageUrl || "").trim();
-    if (!imageUrl) return null;
-
-    const urlArt = normalizeFetchedBytes(await fetchBytes(imageUrl));
-    if (!urlArt) return null;
-    const result = { ...urlArt, source: "url-chain" };
-    if (cacheable) resolvedCoverCache.set(mbid, result);
-    return result;
-  } catch (error) {
-    logger.warn(logTag, "Cover art resolution failed", {
-      mbid,
-      error: error?.message || String(error),
-    });
-    return null;
-  }
+  const promise = fetchCoverArtBytes(
+    mbid,
+    { resolveUrl, fetchBytes, fetchCaa, logTag, signal },
+    cacheable,
+  ).finally(() => {
+    inFlightCoverFetches.delete(mbid);
+  });
+  inFlightCoverFetches.set(mbid, promise);
+  return promise;
 }
 
-export { resolvedCoverCache };
+export { resolvedCoverCache, inFlightCoverFetches };
