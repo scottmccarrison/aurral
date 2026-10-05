@@ -348,17 +348,18 @@ test("reconcileClaims heals a wedged pending job and keeps live handoffs", () =>
   // wedged-job residue this heals: the transition that should have released
   // the claim never reached this process, so markActive() would refuse the
   // release forever and the job would be re-enqueued every 30s.
+  // `cancel_requested` is now kept at any age (it always terminates in `cancelled`).
   resetAll();
   seedAll();
   const old = reconcileClaims(readStatus, {
     now: Date.now() + STALE_MS + MINUTE_MS,
     staleMs: STALE_MS,
   });
-  assert.deepEqual(old, { reaped: 3 }, "both stale pending owners and the stale cancel_requested");
+  assert.deepEqual(old, { reaped: 2 }, "stale pending owners are reaped; cancel_requested is kept");
   assert.deepEqual(
-    getStats().activeReleases.map((entry) => entry.jobId),
-    ["job-downloading"],
-    "a downloading owner keeps its claim regardless of age: the provider transfer ends it",
+    getStats().activeReleases.map((entry) => entry.jobId).sort(),
+    ["job-cancel-requested", "job-downloading"].sort(),
+    "downloading and cancel_requested owners keep their claims regardless of age",
   );
 
   // Idempotent: a second pass finds nothing left to reap.
@@ -380,8 +381,61 @@ test("reconcileClaims heals a wedged pending job and keeps live handoffs", () =>
   );
 });
 
+test("reconcileClaims reaps downloading claims older than 6h (orphaned backstop)", () => {
+  const statuses = new Map([
+    ["job-downloading-young", "downloading"],
+    ["job-downloading-old", "downloading"],
+  ]);
+  const readStatus = (jobId) => statuses.get(jobId) ?? null;
+
+  // Young downloading claim (30 min): kept unconditionally.
+  claimFor("job-downloading-young", ["key-young"], "slskd");
+  const youngResult = reconcileClaims(readStatus, {
+    now: Date.now() + 30 * MINUTE_MS,
+    staleMs: STALE_MS,
+  });
+  assert.deepEqual(youngResult, { reaped: 0 }, "young downloading claim is kept");
+  assert.equal(getStats().activeReleases.length, 1);
+
+  // Old downloading claim (7 hours): reaped as orphaned.
+  resetAll();
+  claimFor("job-downloading-old", ["key-old"], "slskd");
+  const oldResult = reconcileClaims(readStatus, {
+    now: Date.now() + 7 * 60 * MINUTE_MS,
+    staleMs: STALE_MS,
+  });
+  assert.deepEqual(oldResult, { reaped: 1 }, "downloading claim older than 6h is reaped");
+  assert.deepEqual(getStats().activeReleases, []);
+});
+
+test("reconcileClaims keeps cancel_requested claims at any age until they become cancelled", () => {
+  const statuses = new Map([
+    ["job-cancel-requested", "cancel_requested"],
+    ["job-cancelled", "cancelled"],
+  ]);
+  const readStatus = (jobId) => statuses.get(jobId) ?? null;
+
+  // cancel_requested claim 2 hours old: kept (not age-reaped).
+  claimFor("job-cancel-requested", ["key-cancel-requested"], "slskd");
+  const keepResult = reconcileClaims(readStatus, {
+    now: Date.now() + 2 * 60 * MINUTE_MS,
+    staleMs: STALE_MS,
+  });
+  assert.deepEqual(keepResult, { reaped: 0 }, "cancel_requested claim is kept at any age");
+  assert.equal(getStats().activeReleases.length, 1);
+
+  // Once the job transitions to cancelled (terminal), the claim is reaped.
+  statuses.set("job-cancel-requested", "cancelled");
+  const reapResult = reconcileClaims(readStatus, {
+    now: Date.now() + 2 * 60 * MINUTE_MS,
+    staleMs: STALE_MS,
+  });
+  assert.deepEqual(reapResult, { reaped: 1 }, "cancelled claim is reaped");
+  assert.deepEqual(getStats().activeReleases, []);
+});
+
 test("reconcileClaims keeps claims when the status read fails and sanitizes options", () => {
-  claimFor("job-unknown", ["key-unknown"], "slskd");
+   claimFor("job-unknown", ["key-unknown"], "slskd");
 
   const throwing = reconcileClaims(() => {
     throw new Error("database is locked");

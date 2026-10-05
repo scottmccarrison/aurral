@@ -41,9 +41,14 @@ const HOUR_MS = 60 * 60 * 1000;
 const FAILURE_KEY_SEPARATOR = "|";
 /** Claim age after which a non-`downloading` owner is treated as wedged. */
 const DEFAULT_CLAIM_STALE_MS = 10 * 60 * 1000;
+/** Claim age after which a `downloading` owner is treated as orphaned (no legitimate download takes 6h). */
+const DOWNLOADING_CLAIM_MAX_AGE_MS = 6 * HOUR_MS;
 /**
  * Job statuses that can never own a live claim. The full vocabulary is
  * pending, downloading, cancel_requested, cancelled, done, failed, blocked.
+ * Note: `cancel_requested` is deliberately NOT terminal — it always transitions
+ * to `cancelled` (which IS terminal), so we keep its claims at any age to avoid
+ * a new job claiming the release while the old one is still dying.
  */
 const TERMINAL_JOB_STATUSES = new Set(["done", "failed", "cancelled", "blocked"]);
 
@@ -382,12 +387,21 @@ export function pruneExpired() {
  * A claim is dropped when its owner job:
  *   - is missing (deleted/cleared), or
  *   - is terminal (`done`, `failed`, `cancelled`, `blocked`), or
- *   - is NOT `downloading` and the claim is older than `staleMs`.
+ *   - is `downloading` AND older than DOWNLOADING_CLAIM_MAX_AGE_MS (orphaned), or
+ *   - is NOT `downloading`, NOT `cancel_requested`, and older than `staleMs`.
  *
- * The last rule is the wedge-heal: a `pending` owner with a young claim is a
- * legitimate in-flight handoff and is kept, while a `pending` owner with an
- * old claim is residue from a transition that never released it — exactly the
- * state that made markActive() refuse the release forever.
+ * The `downloading` backstop reaps orphaned records (crash without _load() reset)
+ * that would wedge the release forever. Young `downloading` claims are kept
+ * unconditionally because the provider transfer, not the clock, decides when it ends.
+ *
+ * `cancel_requested` claims are kept at any age: the state always terminates in
+ * `cancelled` (which IS terminal and gets reaped then), so exempting them avoids
+ * a new job claiming the release while the old one is still dying.
+ *
+ * The age-reap rule for other non-terminal statuses is the wedge-heal: a `pending`
+ * owner with a young claim is a legitimate in-flight handoff and is kept, while a
+ * `pending` owner with an old claim is residue from a transition that never released
+ * it — exactly the state that made markActive() refuse the release forever.
  *
  * `getJobStatus(jobId)` returns the owner's status or null/undefined when the
  * job is unknown. Without a status reader nothing can be proven stale, so
@@ -397,42 +411,44 @@ export function pruneExpired() {
  * keyed under several release identities, and each entry is counted).
  */
 export function reconcileClaims(getJobStatus, options = {}) {
-  if (typeof getJobStatus !== "function") return { reaped: 0 };
-  const safeOptions =
-    options && typeof options === "object" && !Array.isArray(options) ? options : {};
-  const parsedNow = Number(safeOptions.now);
-  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
-  const parsedStaleMs = Number(safeOptions.staleMs);
-  const staleMs =
-    Number.isFinite(parsedStaleMs) && parsedStaleMs >= 0
-      ? parsedStaleMs
-      : DEFAULT_CLAIM_STALE_MS;
-  let reaped = 0;
-  for (const [releaseKey, entry] of activeReleases) {
-    let status;
-    try {
-      status = getJobStatus(entry?.jobId);
-    } catch (error) {
-      logger.warn("dedup", "Claim reconcile could not read job status", {
-        releaseKey,
-        jobId: entry?.jobId || null,
-        error: error?.message || String(error),
-      });
-      continue;
-    }
-    const safeStatus = String(status ?? "").trim();
-    const startedAt = Number(entry?.startedAt) || 0;
-    const missing = !safeStatus;
-    const terminal = TERMINAL_JOB_STATUSES.has(safeStatus);
-    const stale = now - startedAt > staleMs;
-    // `downloading` owners keep their claim regardless of age: the provider
-    // transfer, not the clock, decides when it ends.
-    if (!missing && !terminal && (safeStatus === "downloading" || !stale)) continue;
-    activeReleases.delete(releaseKey);
-    reaped += 1;
-  }
-  return { reaped };
-}
+   if (typeof getJobStatus !== "function") return { reaped: 0 };
+   const safeOptions =
+     options && typeof options === "object" && !Array.isArray(options) ? options : {};
+   const parsedNow = Number(safeOptions.now);
+   const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+   const parsedStaleMs = Number(safeOptions.staleMs);
+   const staleMs =
+     Number.isFinite(parsedStaleMs) && parsedStaleMs >= 0
+       ? parsedStaleMs
+       : DEFAULT_CLAIM_STALE_MS;
+   let reaped = 0;
+   for (const [releaseKey, entry] of activeReleases) {
+     let status;
+     try {
+       status = getJobStatus(entry?.jobId);
+     } catch (error) {
+       logger.warn("dedup", "Claim reconcile could not read job status", {
+         releaseKey,
+         jobId: entry?.jobId || null,
+         error: error?.message || String(error),
+       });
+       continue;
+     }
+     const safeStatus = String(status ?? "").trim();
+     const startedAt = Number(entry?.startedAt) || 0;
+     const missing = !safeStatus;
+     const terminal = TERMINAL_JOB_STATUSES.has(safeStatus);
+     const stale = now - startedAt > staleMs;
+     const downloadingTooOld = safeStatus === "downloading" && now - startedAt > DOWNLOADING_CLAIM_MAX_AGE_MS;
+     // Keep if: owner is present AND (not terminal) AND (
+     //   downloading (but not orphaned) OR cancel_requested OR young
+     // )
+     if (!missing && !terminal && !downloadingTooOld && (safeStatus === "downloading" || safeStatus === "cancel_requested" || !stale)) continue;
+     activeReleases.delete(releaseKey);
+     reaped += 1;
+   }
+   return { reaped };
+ }
 
 /** Serializable snapshot for the dashboard API (via flow-owner RPC). */
 export function getStats() {
