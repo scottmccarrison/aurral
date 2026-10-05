@@ -23,10 +23,14 @@ import {
   isPipelinePayloadActive,
 } from "./weeklyFlowDownloadCancellation.js";
 import {
-  clearJob as clearDedupJob,
   getReleaseKeys,
-  markComplete,
+  reconcileClaims as reconcileDedupClaims,
+  releaseJobState as releaseDedupJobState,
 } from "../downloadDedupService.js";
+import {
+  isFlowOwnerProcess,
+  requestFlowOwner,
+} from "./weeklyFlowOwnerClient.js";
 
 const parseDeniedSources = (raw) => {
   if (!raw) return [];
@@ -39,6 +43,26 @@ const parseDeniedSources = (raw) => {
 };
 
 const JOBS_TABLE = "playlist_download_jobs";
+/** Cross-process claim releases are best-effort and must never hang a mutation. */
+const CLAIM_RELEASE_TIMEOUT_MS = 5000;
+/** Claim age after which a non-`downloading` owner counts as wedged (issue #13). */
+const DEFAULT_CLAIM_STALE_MS = 10 * 60 * 1000;
+/**
+ * Statuses that can never own a live claim or a dispatch mark. Full
+ * vocabulary: pending, downloading, cancel_requested, cancelled, done,
+ * failed, blocked.
+ */
+const TERMINAL_JOB_STATUSES = new Set(["done", "failed", "cancelled", "blocked"]);
+
+/** One id or an array of ids -> a clean, de-duplicated array of id strings. */
+function normalizeJobIdList(jobIds) {
+  const ids = (Array.isArray(jobIds) ? jobIds : [jobIds])
+    .filter((id) => typeof id === "string" || typeof id === "number")
+    .map((id) => String(id).trim())
+    .filter(Boolean);
+  return [...new Set(ids)];
+}
+
 const dataVersionStmt = db.prepare("PRAGMA data_version");
 const persistedRevisionStmt = db.prepare(
   "SELECT revision FROM playlist_download_jobs_revision WHERE id = 1",
@@ -396,6 +420,87 @@ export class WeeklyFlowDownloadTracker {
     } else {
       clearTransientPipelineMetaStmt.run(id);
     }
+  }
+
+  /**
+   * Release flow-owned job state for one job or a batch IN THIS PROCESS:
+   * the slskd dispatch marks (the Set half of clearSlskdPipelineState) plus
+   * every dedup claim those jobs hold. No DB write is repeated here — the
+   * caller has already persisted its own status/metadata change.
+   *
+   * The dedup registries only exist in the flow worker process, so callers
+   * outside it must go through _releaseJobStateRemote() / the
+   * "releaseJobState" flow command instead of clearing an empty local copy.
+   * Returns { released } — the number of dedup claim entries dropped.
+   */
+  releaseJobState(jobIds, options = {}) {
+    const ids = normalizeJobIdList(jobIds);
+    for (const id of ids) {
+      this.clearSlskdDispatched(id);
+    }
+    return releaseDedupJobState(ids, options);
+  }
+
+  /**
+   * Single choke point for every transition that gives up a job's claim on
+   * its release (issue #13). In the flow owner this runs the local cleanup
+   * that used to happen inline; anywhere else it hands the same work to the
+   * owner over RPC.
+   *
+   * Fire-and-forget by design: tracker mutations are synchronous with 20+
+   * call sites and must never block on the worker. A failed release is logged
+   * and left for reconcileJobState() to reap.
+   */
+  _releaseJobStateRemote(jobIds, options = {}) {
+    const ids = normalizeJobIdList(jobIds);
+    if (ids.length === 0) return;
+    // Deliberately evaluated per call, never cached: the same tracker class
+    // serves both the web process and the flow owner.
+    if (isFlowOwnerProcess()) {
+      this.releaseJobState(ids, options);
+      return;
+    }
+    void requestFlowOwner("releaseJobState", [ids, options], {
+      timeoutMs: CLAIM_RELEASE_TIMEOUT_MS,
+    }).catch((error) => {
+      logger.warn("flow-claims", "Cross-process claim release failed", {
+        ids,
+        error: error?.message || String(error),
+      });
+    });
+  }
+
+  /**
+   * Heal wedged jobs (issue #13): drop dispatch marks whose job is missing or
+   * terminal, and reap dedup claims whose owner can no longer be downloading.
+   * This is the safety net for releases that never arrived — a web-process
+   * transition that failed to reach the owner, or a worker that died holding
+   * a claim. Runs in the flow owner (the "system-task" queue and the
+   * "reconcileDedupClaims" command both land here). Idempotent.
+   * Returns { claimsReaped, dispatchedCleared }.
+   */
+  reconcileJobState(options = {}) {
+    const safeOptions =
+      options && typeof options === "object" && !Array.isArray(options) ? options : {};
+    const parsedNow = Number(safeOptions.now);
+    const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+    const parsedStaleMs = Number(safeOptions.staleMs);
+    const staleMs =
+      Number.isFinite(parsedStaleMs) && parsedStaleMs >= 0
+        ? parsedStaleMs
+        : DEFAULT_CLAIM_STALE_MS;
+    let dispatchedCleared = 0;
+    for (const id of [...this.slskdDispatched]) {
+      const status = this.jobs.get(id)?.status || null;
+      if (status && !TERMINAL_JOB_STATUSES.has(status)) continue;
+      this.slskdDispatched.delete(id);
+      dispatchedCleared += 1;
+    }
+    const { reaped } = reconcileDedupClaims(
+      (jobId) => this.jobs.get(jobId)?.status ?? null,
+      { now, staleMs },
+    );
+    return { claimsReaped: reaped, dispatchedCleared };
   }
 
   updateDownloadMetadata(id, metadata = {}) {
@@ -996,7 +1101,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job) return false;
     cancelDownloadJob(id);
     this.clearSlskdPipelineState(id);
-    clearDedupJob(id);
+    this._releaseJobStateRemote(id);
     this.jobs.delete(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
@@ -1125,7 +1230,7 @@ export class WeeklyFlowDownloadTracker {
     const previousStatus = job.status;
     const asRetryCycle = options?.asRetryCycle === true;
     this.clearSlskdPipelineState(id);
-    clearDedupJob(id);
+    this._releaseJobStateRemote(id);
     job.status = "pending";
     job.startedAt = null;
     job.completedAt = null;
@@ -1191,7 +1296,7 @@ export class WeeklyFlowDownloadTracker {
     }
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
-    clearDedupJob(id);
+    this._releaseJobStateRemote(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1209,6 +1314,10 @@ export class WeeklyFlowDownloadTracker {
     const job = this.jobs.get(id);
     if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
+    // Capture every release identity BEFORE anything below touches the job:
+    // the claim was made under these keys, and the forget-half of the release
+    // has to target the same identities (albumName may still be rewritten).
+    const releaseKeys = getReleaseKeys(job);
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
@@ -1228,9 +1337,7 @@ export class WeeklyFlowDownloadTracker {
     this._applyStatusDelta(job.playlistType, previousStatus, job.status);
     // The release landed: clear every identity it could have been claimed
     // under (jobs gain releaseGuid mid-lifecycle) and forget its failures.
-    for (const releaseKey of getReleaseKeys(job)) {
-      markComplete(releaseKey);
-    }
+    this._releaseJobStateRemote(id, { forgetFailures: true, releaseKeys });
     return true;
   }
 
@@ -1239,7 +1346,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
-    clearDedupJob(id);
+    this._releaseJobStateRemote(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1257,7 +1364,7 @@ export class WeeklyFlowDownloadTracker {
     if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
-    clearDedupJob(id);
+    this._releaseJobStateRemote(id);
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1347,15 +1454,17 @@ export class WeeklyFlowDownloadTracker {
 
   resetDownloadingToPending() {
     let count = 0;
+    const releasedIds = [];
     for (const job of this.jobs.values()) {
       if (job.status === "cancel_requested" || (job.status === "downloading" && this._isCancelledAlbumJob(job))) {
+        // setCancelled releases this job's own claim state.
         this.setCancelled(job.id);
         continue;
       }
       if (job.status === "downloading") {
         const previousStatus = job.status;
         this.clearSlskdPipelineState(job.id);
-        clearDedupJob(job.id);
+        releasedIds.push(job.id);
         job.status = "pending";
         job.startedAt = null;
         job.stagingPath = null;
@@ -1373,6 +1482,8 @@ export class WeeklyFlowDownloadTracker {
         count++;
       }
     }
+    // One batched release for every job put back in the queue.
+    this._releaseJobStateRemote(releasedIds);
     return count;
   }
 
@@ -1394,7 +1505,6 @@ export class WeeklyFlowDownloadTracker {
       if (job.status !== "pending" && job.status !== "downloading") continue;
       const previousStatus = job.status;
       this.clearSlskdPipelineState(job.id);
-      clearDedupJob(job.id);
       this.pendingSet.delete(job.id);
       this.pendingRetrySet.delete(job.id);
       this._removeFromPendingQueues(job.id);
@@ -1409,6 +1519,8 @@ export class WeeklyFlowDownloadTracker {
       failedJobs.push(job);
       count += 1;
     }
+    // One batched release for the whole playlist instead of one per job.
+    this._releaseJobStateRemote(failedJobs.map((job) => job.id));
     if (failedJobs.length > 0) {
       import("../aurralHistoryService.js")
         .then(({ recordTrackJobFailed }) => {
@@ -1479,7 +1591,6 @@ export class WeeklyFlowDownloadTracker {
     }
     cancelDownloadJobs(toDelete);
     for (const id of toDelete) {
-      clearDedupJob(id);
       this.jobs.delete(id);
       if (cleanPending) {
         this.pendingSet.delete(id);
@@ -1489,6 +1600,8 @@ export class WeeklyFlowDownloadTracker {
       deleteStmt.run(id);
     }
     if (toDelete.length > 0) {
+      // ONE batched release for the whole deletion, never one RPC per job.
+      this._releaseJobStateRemote(toDelete);
       this._rebuildStatsByPlaylistType();
       this._touchRevision();
     }
@@ -1524,9 +1637,9 @@ export class WeeklyFlowDownloadTracker {
 
   clearAll() {
     const count = this.jobs.size;
-    for (const id of this.jobs.keys()) {
-      clearDedupJob(id);
-    }
+    // Capture the ids before the map is emptied: the owner needs the full
+    // batch to release every claim these jobs held.
+    this._releaseJobStateRemote([...this.jobs.keys()]);
     this.jobs.clear();
     this.statsByPlaylistType.clear();
     this.globalStats = this._emptyStats();
@@ -1534,6 +1647,8 @@ export class WeeklyFlowDownloadTracker {
     this.pendingRetryQueue = [];
     this.pendingSet = new Set();
     this.pendingRetrySet = new Set();
+    // Also drops marks for ids that outlived their job (previously leaked).
+    this.slskdDispatched = new Set();
     deleteAllStmt.run();
     this._touchRevision();
     return count;

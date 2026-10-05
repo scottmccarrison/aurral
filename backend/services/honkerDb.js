@@ -129,6 +129,16 @@ export const SCHEDULED_SYSTEM_TASKS = [
     payload: { kind: "review-timeout-sweep" },
   },
   {
+    name: "dedup-claim-reconcile",
+    // MUST stay on "system-task" (flow-owned queue): the reconcile prunes the
+    // dedup claim registries and the tracker's slskd dispatch marks, and both
+    // only exist in the flow worker process that owns these maps (issue #13).
+    // Running it anywhere else would reconcile an empty copy and heal nothing.
+    queue: "system-task",
+    schedule: "@every 15m",
+    payload: { kind: "dedup-claim-reconcile" },
+  },
+  {
     name: "playlist-mbid-enrichment-sweep",
     queue: "playlist-mbid-enrichment",
     schedule: "@every 6h",
