@@ -1289,14 +1289,16 @@ export class WeeklyFlowDownloadTracker {
     return true;
   }
 
-  setCancelled(id) {
+  setCancelled(id, options = {}) {
     const job = this.jobs.get(id);
     if (!job || !["pending", "downloading", "cancel_requested"].includes(job.status)) {
       return false;
     }
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
-    this._releaseJobStateRemote(id);
+    if (!options.skipClaimRelease) {
+      this._releaseJobStateRemote(id);
+    }
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -1457,8 +1459,9 @@ export class WeeklyFlowDownloadTracker {
     const releasedIds = [];
     for (const job of this.jobs.values()) {
       if (job.status === "cancel_requested" || (job.status === "downloading" && this._isCancelledAlbumJob(job))) {
-        // setCancelled releases this job's own claim state.
-        this.setCancelled(job.id);
+        // setCancelled with skipClaimRelease: we'll batch all releases at the end.
+        this.setCancelled(job.id, { skipClaimRelease: true });
+        releasedIds.push(job.id);
         continue;
       }
       if (job.status === "downloading") {
@@ -1482,7 +1485,7 @@ export class WeeklyFlowDownloadTracker {
         count++;
       }
     }
-    // One batched release for every job put back in the queue.
+    // One batched release for all jobs (both cancelled and reset to pending).
     this._releaseJobStateRemote(releasedIds);
     return count;
   }

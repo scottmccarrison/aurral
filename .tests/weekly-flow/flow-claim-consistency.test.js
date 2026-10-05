@@ -683,47 +683,123 @@ test("batch transitions release once with the whole id array", async () => {
   assert.deepEqual(releaseArgs(resetCalls).options, {});
 
   // clearAll: ONE RPC with every id, captured before the map is emptied.
-  const allIds = tracker.getAll().map((job) => job.id);
-  assert.ok(allIds.length >= 3);
-  const clearCalls = await captureReleaseRpc(() => tracker.clearAll());
-  assert.equal(clearCalls.length, 1);
-  assert.deepEqual(releaseArgs(clearCalls).ids.sort(), [...allIds].sort());
-  assert.deepEqual(releaseArgs(clearCalls).options, {});
-});
+   const allIds = tracker.getAll().map((job) => job.id);
+   assert.ok(allIds.length >= 3);
+   const clearCalls = await captureReleaseRpc(() => tracker.clearAll());
+   assert.equal(clearCalls.length, 1);
+   assert.deepEqual(releaseArgs(clearCalls).ids.sort(), [...allIds].sort());
+   assert.deepEqual(releaseArgs(clearCalls).options, {});
+ });
 
-test("a transition with nothing to release still reports no RPC for empty batches", async () => {
+ test("resetDownloadingToPending batches mixed cancel_requested and downloading jobs into one RPC", async () => {
+   const tracker = new WeeklyFlowDownloadTracker();
+   // Create 2 cancel_requested jobs and 3 downloading jobs
+   const cancelA = seedJob(tracker, TRACK, "mixed-playlist");
+   const cancelB = seedJob(tracker, OTHER_TRACK, "mixed-playlist");
+   const downloadA = seedJob(tracker, { ...TRACK, trackName: "Download A" }, "mixed-playlist");
+   const downloadB = seedJob(tracker, { ...TRACK, trackName: "Download B" }, "mixed-playlist");
+   const downloadC = seedJob(tracker, { ...OTHER_TRACK, trackName: "Download C" }, "mixed-playlist");
+
+   // Set up the states
+   tracker.setDownloading(cancelA);
+   tracker.setCancelRequested(cancelA);
+   tracker.setDownloading(cancelB);
+   tracker.setCancelRequested(cancelB);
+   tracker.setDownloading(downloadA);
+   tracker.setDownloading(downloadB);
+   tracker.setDownloading(downloadC);
+
+   // Capture the RPC call
+   const calls = await captureReleaseRpc(() => tracker.resetDownloadingToPending());
+
+   // Should fire exactly ONE RPC with all 5 ids
+   assert.equal(calls.length, 1, "resetDownloadingToPending must fire exactly one RPC for mixed states");
+   const { ids, options } = releaseArgs(calls);
+   assert.deepEqual(ids.sort(), [cancelA, cancelB, downloadA, downloadB, downloadC].sort(),
+     "the RPC must include all 5 job ids (2 cancel_requested + 3 downloading)");
+   assert.deepEqual(options, {}, "no special options for the batch release");
+ });
+
+ test("a transition with nothing to release still reports no RPC for empty batches", async () => {
   const tracker = new WeeklyFlowDownloadTracker();
   const calls = await captureReleaseRpc(() => tracker.failActiveJobsForPlaylist("no-such-playlist"));
   assert.deepEqual(calls, [], "an empty batch must not spend an RPC");
 });
 
 test("in the flow owner the same transitions clean up locally without any RPC", () => {
-  assert.equal(isFlowOwnerProcess(), true, "NODE_ENV=test is the flow owner");
-  const calls = installFakeFlowOwner();
-  try {
-    const jobId = seedJob(downloadTracker, TRACK, "owner-playlist");
-    claimFor(jobId, TRACK_KEYS);
-    // A different source than the claim holder, so the claim survives until
-    // setDone releases it (markFailed drops a claim only for its own source).
-    markFailed(TRACK_KEYS[0], "usenet", new Error("provider exploded"));
-    downloadTracker.markSlskdDispatched(jobId);
-    downloadTracker.setDownloading(jobId);
-    assert.deepEqual(activeKeysFor(jobId), [...TRACK_KEYS].sort());
-    assert.equal(failureKeys().length, 1);
+   assert.equal(isFlowOwnerProcess(), true, "NODE_ENV=test is the flow owner");
+   const calls = installFakeFlowOwner();
+   try {
+     const jobId = seedJob(downloadTracker, TRACK, "owner-playlist");
+     claimFor(jobId, TRACK_KEYS);
+     // A different source than the claim holder, so the claim survives until
+     // setDone releases it (markFailed drops a claim only for its own source).
+     markFailed(TRACK_KEYS[0], "usenet", new Error("provider exploded"));
+     downloadTracker.markSlskdDispatched(jobId);
+     downloadTracker.setDownloading(jobId);
+     assert.deepEqual(activeKeysFor(jobId), [...TRACK_KEYS].sort());
+     assert.equal(failureKeys().length, 1);
 
-    downloadTracker.setDone(jobId, "/library/Claim Song.flac", "Claim Album");
+     downloadTracker.setDone(jobId, "/library/Claim Song.flac", "Claim Album");
 
-    assert.deepEqual(calls, [], "the owner never RPCs itself");
-    assert.deepEqual(activeKeysFor(jobId), [], "the claim is gone locally");
-    assert.deepEqual(failureKeys(), [], "setDone forgot the release's failures locally");
-    assert.equal(downloadTracker.slskdDispatched.has(jobId), false, "dispatch mark cleared");
-    assert.equal(downloadTracker.getJob(jobId)?.status, "done");
-  } finally {
-    resetFlowOwnerClient();
-  }
-});
+     assert.deepEqual(calls, [], "the owner never RPCs itself");
+     assert.deepEqual(activeKeysFor(jobId), [], "the claim is gone locally");
+     assert.deepEqual(failureKeys(), [], "setDone forgot the release's failures locally");
+     assert.equal(downloadTracker.slskdDispatched.has(jobId), false, "dispatch mark cleared");
+     assert.equal(downloadTracker.getJob(jobId)?.status, "done");
+   } finally {
+     resetFlowOwnerClient();
+   }
+ });
 
-test("a failed cross-process release is swallowed, never thrown at the caller", async () => {
+ test("in the flow owner resetDownloadingToPending cleans up all mixed-state jobs locally", () => {
+   assert.equal(isFlowOwnerProcess(), true, "NODE_ENV=test is the flow owner");
+   const calls = installFakeFlowOwner();
+   try {
+     // Create 2 cancel_requested jobs and 3 downloading jobs
+     const cancelA = seedJob(downloadTracker, TRACK, "owner-mixed-playlist");
+     const cancelB = seedJob(downloadTracker, OTHER_TRACK, "owner-mixed-playlist");
+     const downloadA = seedJob(downloadTracker, { ...TRACK, trackName: "Download A" }, "owner-mixed-playlist");
+     const downloadB = seedJob(downloadTracker, { ...TRACK, trackName: "Download B" }, "owner-mixed-playlist");
+     const downloadC = seedJob(downloadTracker, { ...OTHER_TRACK, trackName: "Download C" }, "owner-mixed-playlist");
+
+     // Plant claims for all 5 jobs
+     claimFor(cancelA, TRACK_KEYS);
+     claimFor(cancelB, OTHER_KEYS);
+     claimFor(downloadA, [`key-downloadA`]);
+     claimFor(downloadB, [`key-downloadB`]);
+     claimFor(downloadC, [`key-downloadC`]);
+
+     // Set up the states
+     downloadTracker.setDownloading(cancelA);
+     downloadTracker.setCancelRequested(cancelA);
+     downloadTracker.setDownloading(cancelB);
+     downloadTracker.setCancelRequested(cancelB);
+     downloadTracker.setDownloading(downloadA);
+     downloadTracker.setDownloading(downloadB);
+     downloadTracker.setDownloading(downloadC);
+
+     // Verify all claims are active before reset
+     assert.equal(getStats().activeReleases.length, 7, "all 7 claim identities are active");
+
+     downloadTracker.resetDownloadingToPending();
+
+     // Owner never RPCs itself
+     assert.deepEqual(calls, [], "the owner never RPCs itself");
+     // All claims are released locally
+     assert.deepEqual(getStats().activeReleases, [], "all claims are released locally");
+     // All jobs are properly transitioned
+     assert.equal(downloadTracker.getJob(cancelA)?.status, "cancelled");
+     assert.equal(downloadTracker.getJob(cancelB)?.status, "cancelled");
+     assert.equal(downloadTracker.getJob(downloadA)?.status, "pending");
+     assert.equal(downloadTracker.getJob(downloadB)?.status, "pending");
+     assert.equal(downloadTracker.getJob(downloadC)?.status, "pending");
+   } finally {
+     resetFlowOwnerClient();
+   }
+ });
+
+ test("a failed cross-process release is swallowed, never thrown at the caller", async () => {
   const tracker = new WeeklyFlowDownloadTracker();
   const jobId = seedJob(tracker, TRACK, "flow-down-playlist");
   const calls = installFakeFlowOwner({ failWith: new Error("Flow worker is not ready") });
