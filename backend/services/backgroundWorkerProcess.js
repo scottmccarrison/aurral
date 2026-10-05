@@ -27,7 +27,57 @@ const FLOW_COMMANDS = new Set([
   "wakeOrStart", "syncSharedPlaylistImport",
   "enqueueManualMissingSelection", "enqueueManualReplacementSelection",
   "getDedupStats",
+  // Dedup claims and slskd dispatch marks only exist in this process, so
+  // other processes must release/reconcile them here (issue #13).
+  "releaseJobState", "reconcileDedupClaims",
 ]);
+
+/**
+ * Flow-command argument guards for the claim-release commands (issue #13).
+ * Callers are internal, but a malformed release must never widen into a
+ * release for the wrong job or a blanket failure-memory wipe, so unusable
+ * ids are rejected outright and options are sanitized down to a safe shape.
+ */
+function parseReleaseJobIds(raw) {
+  const values = typeof raw === "string" ? [raw] : raw;
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error("releaseJobState requires a job id or a non-empty array of job ids");
+  }
+  const ids = [];
+  for (const value of values) {
+    if (typeof value !== "string") {
+      throw new Error("releaseJobState job ids must be strings");
+    }
+    const id = value.trim();
+    if (!id) {
+      throw new Error("releaseJobState job ids must not be empty");
+    }
+    if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function parseReleaseOptions(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const releaseKeys = Array.isArray(raw.releaseKeys)
+    ? raw.releaseKeys
+      .filter((key) => typeof key === "string" && key.trim())
+      .map((key) => key.trim())
+    : [];
+  // Unknown option keys are dropped; forgetting failures only ever happens
+  // for explicitly supplied release identities.
+  return { forgetFailures: raw.forgetFailures === true, releaseKeys };
+}
+
+function parseReconcileOptions(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const options = {};
+  const now = Number(raw.now);
+  if (Number.isFinite(now)) options.now = now;
+  const staleMs = Number(raw.staleMs);
+  if (Number.isFinite(staleMs) && staleMs >= 0) options.staleMs = staleMs;
+  return options;
+}
 
 async function handleFlowCommand(message) {
   const { requestId, method, args = [] } = message;
@@ -85,6 +135,15 @@ async function handleFlowCommand(message) {
     } else if (method === "getDedupStats") {
       const { getStats } = await import("./downloadDedupService.js");
       result = getStats();
+    } else if (method === "releaseJobState") {
+      const { downloadTracker } = await import("./weeklyFlow/weeklyFlowDownloadTracker.js");
+      result = downloadTracker.releaseJobState(
+        parseReleaseJobIds(args[0]),
+        parseReleaseOptions(args[1]),
+      );
+    } else if (method === "reconcileDedupClaims") {
+      const { downloadTracker } = await import("./weeklyFlow/weeklyFlowDownloadTracker.js");
+      result = downloadTracker.reconcileJobState(parseReconcileOptions(args[0]));
     } else {
       result = await flowWorker[method](...args);
     }

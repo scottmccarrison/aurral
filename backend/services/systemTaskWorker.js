@@ -136,6 +136,13 @@ export async function processSystemTask(payload = {}, job = null) {
       const result = await enforceReviewTimeouts();
       return result;
     }
+    case "dedup-claim-reconcile": {
+      // Runs on the flow-owned "system-task" queue: the claim registries and
+      // dispatch marks it prunes only exist in this process (issue #13).
+      const { downloadTracker } = await import("./weeklyFlow/weeklyFlowDownloadTracker.js");
+      const result = downloadTracker.reconcileJobState();
+      return result;
+    }
     case "playlist-startup-migration": {
       const [
         migrationModule,
