@@ -142,6 +142,7 @@ export function registerGeneral(router) {
         inbox,
         dateTimeFormat,
         matching,
+        enrichment,
       } = req.body;
 
       if (dateTimeFormat !== undefined && !DATE_TIME_FORMATS.includes(dateTimeFormat)) {
@@ -556,6 +557,17 @@ export function registerGeneral(router) {
               }
             : currentSettings.matching ||
               defaultData.settings.matching,
+        // Approved deviation (issue #14): the repair kill switches must be
+        // settable over HTTP, so enrichment is whitelisted alongside matching.
+        enrichment:
+          enrichment !== undefined
+            ? {
+                ...(currentSettings.enrichment ||
+                  defaultData.settings.enrichment),
+                ...enrichment,
+              }
+            : currentSettings.enrichment ||
+              defaultData.settings.enrichment,
       };
 
       if (updatedSettings?.integrations?.coverArtArchive) {

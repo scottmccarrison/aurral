@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { parseFile } from "music-metadata";
 import {
   buildFallbackIdentityKey,
@@ -15,6 +17,8 @@ import {
   withLibraryScan,
 } from "./libraryMediaStore.js";
 import { parseAurralIdentityComment } from "./playlistDownloadUtils.js";
+
+const execFileAsync = promisify(execFile);
 
 const AUDIO_EXTENSIONS = new Set([
   ".aac",
@@ -42,6 +46,123 @@ const EXCLUDED_DIRECTORIES = new Set([
 export function isLibraryScanExcludedDirectory(name) {
   const value = String(name || "");
   return EXCLUDED_DIRECTORIES.has(value) || value.startsWith(".");
+}
+
+// Sidecar cover filenames recognised next to an audio file. Compared
+// case-insensitively, exactly the set the repair sweep is allowed to write.
+const SIDECAR_ART_FILENAMES = new Set([
+  "cover.jpg",
+  "cover.png",
+  "folder.jpg",
+  "front.jpg",
+  "front.png",
+  "front.jpeg",
+]);
+
+// Native tag ids that carry an attached picture, upper-cased for comparison:
+// ID3v2 APIC, iTunes/MP4 covr, Vorbis METADATA_BLOCK_PICTURE, FLAC PICTURE.
+const NATIVE_PICTURE_TAG_IDS = new Set([
+  "APIC",
+  "COVR",
+  "COVERART",
+  "PICTURE",
+  "METADATA_BLOCK_PICTURE",
+]);
+
+const hasNativePictureTag = (metadata) => {
+  for (const tags of Object.values(metadata?.native || {})) {
+    if (!Array.isArray(tags)) continue;
+    for (const tag of tags) {
+      if (NATIVE_PICTURE_TAG_IDS.has(String(tag?.id || "").toUpperCase())) return true;
+    }
+  }
+  return false;
+};
+
+/** True when a music-metadata result carries an attached picture. */
+export function metadataHasPicture(metadata) {
+  if (!metadata || typeof metadata !== "object") return false;
+  const picture = metadata.common?.picture;
+  if (Array.isArray(picture) ? picture.length > 0 : Boolean(picture)) return true;
+  return hasNativePictureTag(metadata);
+}
+
+/**
+ * Last-resort picture probe for containers music-metadata cannot parse.
+ * Only reached when the tag parse itself throws, so the common path never
+ * spawns a process.
+ */
+export async function probeEmbeddedArt(filePath) {
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-select_streams",
+        "v",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        filePath,
+      ],
+      { timeout: 15000 },
+    );
+    return String(stdout || "").trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reliable embedded-cover detection.
+ *
+ * The scan parses with `{ skipCovers: true }`, and music-metadata@11 strips
+ * covr/APIC/METADATA_BLOCK_PICTURE from BOTH `common.picture` and `native.*`
+ * under that flag (proved by .tests/library/metadata-repair.test.js). So the
+ * scan's own metadata can never answer this question: re-parse with covers
+ * kept and `duration: false`, which is the cheapest reliable signal available.
+ *
+ * `parse` is injectable for unit tests and defaults to the real tag parser.
+ * The scan deliberately does NOT pass its own `metadataReader` here: that
+ * reader's contract is exactly one call per written file, so routing the cover
+ * re-parse through it would double-count (and double-parse) every file.
+ */
+export async function detectEmbeddedArt(filePath, { metadata = null, parse = parseFile } = {}) {
+  if (metadataHasPicture(metadata)) return true;
+  try {
+    return metadataHasPicture(await parse(filePath, { duration: false }));
+  } catch {
+    return probeEmbeddedArt(filePath);
+  }
+}
+
+/**
+ * True when the directory holds a recognised sidecar cover. Results are memoised
+ * per directory via `cache` because every track in an album shares one lookup.
+ */
+export async function detectSidecarArt(dirPath, cache = null) {
+  const directory = path.resolve(String(dirPath || ""));
+  if (cache?.has(directory)) return cache.get(directory);
+  let found = false;
+  try {
+    const entries = await fs.readdir(directory);
+    found = entries.some((entry) => SIDECAR_ART_FILENAMES.has(String(entry).toLowerCase()));
+  } catch {
+    found = false;
+  }
+  cache?.set(directory, found);
+  return found;
+}
+
+/** Cover-art presence flags for one audio file, computed during a scan. */
+export async function detectArtFlags(filePath, { metadata = null, parse = parseFile, cache = null } = {}) {
+  return {
+    hasEmbeddedArt: await detectEmbeddedArt(filePath, { metadata, parse }),
+    hasSidecarArt: await detectSidecarArt(path.dirname(filePath), cache),
+  };
 }
 
 const text = (value) => String(value || "").trim();
@@ -122,7 +243,7 @@ function readPathFallback(filePath, rootPath) {
   };
 }
 
-function buildMetadataRecord(metadata, filePath, rootPath) {
+function buildMetadataRecord(metadata, filePath, rootPath, artFlags = null) {
   const common = normalizeMetadata(metadata);
   const fallback = readPathFallback(filePath, rootPath);
   const artistName = text(common.albumartist || common.artist) || fallback.artistName;
@@ -168,6 +289,8 @@ function buildMetadataRecord(metadata, filePath, rootPath) {
     durationMs: Number.isFinite(Number(metadata?.format?.duration))
       ? Math.round(Number(metadata.format.duration) * 1000)
       : null,
+    hasEmbeddedArt: artFlags?.hasEmbeddedArt === true,
+    hasSidecarArt: artFlags?.hasSidecarArt === true,
     quality: {
       format: text(metadata?.format?.codec) || null,
       bitrate: Number.isFinite(Number(metadata?.format?.bitrate))
@@ -312,6 +435,8 @@ export async function scanMusicRoot({
   const seenPaths = new Set();
   const failedPaths = new Set();
   const missingFilePaths = new Set();
+  // One readdir per album directory instead of one per track.
+  const sidecarArtCache = new Map();
   const scanResult = await withLibraryScan(source, resolvedRoot, (scanId) => {
     const run = async () => {
       const files = requestedFiles || walkAudioFiles(resolvedRoot);
@@ -338,7 +463,19 @@ export async function scanMusicRoot({
               ? await metadataEnricher(metadata, filePath)
               : null,
           );
-          const record = buildMetadataRecord(enrichedMetadata, filePath, resolvedRoot);
+          const record = buildMetadataRecord(
+            enrichedMetadata,
+            filePath,
+            resolvedRoot,
+            // Art flags are derived on the write path only. `metadata` gives the
+            // cheap short-circuit; the cover re-parse deliberately uses the real
+            // tag parser instead of `metadataReader`, whose contract is exactly
+            // one call per written file (callers and tests count it).
+            await detectArtFlags(filePath, {
+              metadata,
+              cache: sidecarArtCache,
+            }),
+          );
           const artist = upsertLibraryArtist({
             identityKey: record.artistKey,
             mbid: record.artistMbid,
@@ -382,6 +519,8 @@ export async function scanMusicRoot({
             mtimeMs: stat.mtimeMs,
             durationMs: record.durationMs,
             quality: record.quality,
+            hasEmbeddedArt: record.hasEmbeddedArt,
+            hasSidecarArt: record.hasSidecarArt,
             scanId,
           });
           unseenPaths?.delete(filePath);
@@ -490,4 +629,9 @@ export async function scanMusicRoots({ rootPaths = [], changedPaths = null, ...o
   return result;
 }
 
-export { buildMetadataRecord, readPathFallback, AUDIO_EXTENSIONS };
+export {
+  buildMetadataRecord,
+  readPathFallback,
+  AUDIO_EXTENSIONS,
+  SIDECAR_ART_FILENAMES,
+};

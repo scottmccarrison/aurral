@@ -17,10 +17,11 @@ import { resolvePlaylistRoot } from "./playlistPaths.js";
 import {
   buildResolvedPlaylistTrack as buildResolvedTrack,
   commitImportToPlaylistLibrary,
+  enrichDownloadedTrack,
   joinUnderRoot,
   sanitizePathPart,
-  writeAudioMetadata,
 } from "./playlistDownloadUtils.js";
+import { resolveCoverArtBytes } from "./coverArtService.js";
 import { deferForInactiveOwner } from "./weeklyFlow/weeklyFlowOwnerStatus.js";
 import {
   getPayloadCandidate,
@@ -270,8 +271,11 @@ async function handleYtdlpFinalize(payload, helpers) {
   const finalDir = joinUnderRoot(playlistRoot, destination);
   const finalName = `${sanitizePathPart(job.trackName, "Unknown Track")}${ext || ".m4a"}`;
   const finalPath = path.join(finalDir, finalName);
+  // Resolve art before taking the commit lock: the lock serializes every import
+  // in the process, so a network lookup inside it would stall them all.
+  const cover = await resolveCoverArtBytes(resolvedTrack?.albumMbid).catch(() => null);
   const committed = await withPipelineCommitLock(payload, async () => {
-    await writeAudioMetadata(filePath, resolvedTrack);
+    await enrichDownloadedTrack(filePath, finalDir, resolvedTrack, { cover });
     import("./aurralHistoryService.js")
       .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
       .catch((err) => {

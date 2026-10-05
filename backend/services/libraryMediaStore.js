@@ -40,8 +40,8 @@ const getLibraryMediaFileStmt = db.prepare(
 );
 const upsertLibraryMediaFileStmt = db.prepare(
   `INSERT INTO library_media_files
-    (track_id, album_id, source, path, format, size, mtime_ms, duration_ms, quality_json, available, last_seen_scan_id, created_at, updated_at)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (track_id, album_id, source, path, format, size, mtime_ms, duration_ms, quality_json, available, has_embedded_art, has_sidecar_art, last_seen_scan_id, created_at, updated_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
    ON CONFLICT(source, path) DO UPDATE SET
      track_id = excluded.track_id,
      album_id = COALESCE(excluded.album_id, library_media_files.album_id),
@@ -52,6 +52,8 @@ const upsertLibraryMediaFileStmt = db.prepare(
      duration_ms = excluded.duration_ms,
      quality_json = COALESCE(excluded.quality_json, library_media_files.quality_json),
      available = excluded.available,
+     has_embedded_art = excluded.has_embedded_art,
+     has_sidecar_art = excluded.has_sidecar_art,
      last_seen_scan_id = excluded.last_seen_scan_id,
      updated_at = excluded.updated_at`,
 );
@@ -493,6 +495,8 @@ export function upsertLibraryMediaFile({
   durationMs = null,
   quality = null,
   available = true,
+  hasEmbeddedArt = false,
+  hasSidecarArt = false,
   scanId,
 }) {
   const filePath = normalizeText(path);
@@ -509,6 +513,8 @@ export function upsertLibraryMediaFile({
   const normalizedDurationMs = Number.isFinite(Number(durationMs)) ? Number(durationMs) : null;
   const qualityText = stringify(quality);
   const normalizedAvailable = available === true ? 1 : 0;
+  const normalizedEmbeddedArt = hasEmbeddedArt === true ? 1 : 0;
+  const normalizedSidecarArt = hasSidecarArt === true ? 1 : 0;
   const existing = getLibraryMediaFileStmt.get(fileSource, filePath);
   if (
     existing &&
@@ -519,7 +525,9 @@ export function upsertLibraryMediaFile({
     normalizedMtimeMs === existing.mtime_ms &&
     normalizedDurationMs === existing.duration_ms &&
     (qualityText == null || qualityText === existing.quality_json) &&
-    normalizedAvailable === existing.available
+    normalizedAvailable === existing.available &&
+    normalizedEmbeddedArt === Number(existing.has_embedded_art) &&
+    normalizedSidecarArt === Number(existing.has_sidecar_art)
   ) {
     return existing;
   }
@@ -535,6 +543,8 @@ export function upsertLibraryMediaFile({
     normalizedDurationMs,
     qualityText,
     normalizedAvailable,
+    normalizedEmbeddedArt,
+    normalizedSidecarArt,
     Number(scanId),
     timestamp,
     timestamp,
@@ -625,4 +635,177 @@ export async function withLibraryScan(source, rootPath, run) {
 
 export function getLibraryMediaFile({ source, path }) {
   return getLibraryMediaFileStmt.get(normalizeText(source), normalizeText(path));
+}
+
+// ---------------------------------------------------------------------------
+// Metadata gaps (issue #14)
+//
+// One predicate backs both the repair sweep and the read-only
+// GET /api/library/metadata-gaps endpoint so a repaired row always leaves the
+// gap set. Album MBIDs live on library_albums (the scanner maps the
+// musicbrainz_albumid tag to library_albums.mbid and musicbrainz_releasegroupid
+// to library_albums.release_group_mbid), never on library_media_files. The
+// sweep fills BOTH tags, so the predicate requires BOTH: a row that only ever
+// resolves to a release group would otherwise be re-selected on every run.
+//
+// media.album_id IS NOT NULL is required: an orphan media row (no album link)
+// satisfies `album.mbid IS NULL` through the LEFT JOIN, but fillLibraryAlbumMbids
+// keys off album.id and can never fill a NULL album_id. Without this guard the
+// row is a permanent gap - re-selected on every run and starving the fixed
+// per-run batch budget (issue #14).
+// ---------------------------------------------------------------------------
+const METADATA_GAP_FROM = `
+  FROM library_media_files AS media
+  LEFT JOIN library_albums AS album ON album.id = media.album_id
+  LEFT JOIN library_artists AS artist ON artist.id = album.artist_id
+  WHERE media.available = 1
+    AND media.album_id IS NOT NULL
+    AND (
+      media.has_embedded_art = 0
+      OR media.has_sidecar_art = 0
+      OR album.mbid IS NULL
+      OR album.release_group_mbid IS NULL
+    )
+`;
+
+const METADATA_GAP_ART = "(media.has_embedded_art = 0 OR media.has_sidecar_art = 0)";
+const METADATA_GAP_MBID = "(album.mbid IS NULL OR album.release_group_mbid IS NULL)";
+
+const selectMetadataGapRowsStmt = db.prepare(`
+  SELECT
+    media.id AS media_id,
+    media.rowid AS rowid,
+    media.path AS path,
+    media.source AS source,
+    media.has_embedded_art AS has_embedded_art,
+    media.has_sidecar_art AS has_sidecar_art,
+    album.id AS album_id,
+    album.mbid AS album_mbid,
+    album.release_group_mbid AS release_group_mbid,
+    album.title AS album_name,
+    album.album_artist AS album_artist,
+    artist.name AS artist_name,
+    artist.mbid AS artist_mbid
+  ${METADATA_GAP_FROM}
+  ORDER BY media.rowid
+  LIMIT ?
+`);
+
+const countMetadataGapsStmt = db.prepare(`
+  SELECT
+    COALESCE(SUM(CASE WHEN ${METADATA_GAP_ART} THEN 1 ELSE 0 END), 0) AS missing_art,
+    COALESCE(SUM(CASE WHEN ${METADATA_GAP_MBID} THEN 1 ELSE 0 END), 0) AS missing_mbid,
+    COUNT(*) AS total
+  ${METADATA_GAP_FROM}
+`);
+
+const listMetadataGapsStmt = db.prepare(`
+  SELECT
+    media.path AS path,
+    media.has_embedded_art AS has_embedded_art,
+    media.has_sidecar_art AS has_sidecar_art,
+    album.mbid AS album_mbid,
+    album.release_group_mbid AS release_group_mbid
+  ${METADATA_GAP_FROM}
+  ORDER BY media.rowid
+  LIMIT ? OFFSET ?
+`);
+
+const updateMediaArtFlagsStmt = db.prepare(
+  `UPDATE library_media_files
+   SET has_embedded_art = MAX(has_embedded_art, ?),
+       has_sidecar_art = MAX(has_sidecar_art, ?),
+       updated_at = ?
+   WHERE source = ? AND path = ?
+     AND (has_embedded_art < ? OR has_sidecar_art < ?)`,
+);
+
+const fillAlbumMbidsStmt = db.prepare(
+  `UPDATE library_albums
+   SET mbid = COALESCE(mbid, ?),
+       release_group_mbid = COALESCE(release_group_mbid, ?),
+       updated_at = ?
+   WHERE id = ? AND (mbid IS NULL OR release_group_mbid IS NULL)`,
+);
+
+/**
+ * Gap rows for the repair sweep, ordered by rowid and capped at `limit`.
+ * SQL-driven on purpose: the sweep never re-walks the filesystem to find work.
+ */
+export function selectLibraryMetadataGapRows({ limit = 200 } = {}) {
+  const parsed = Number(limit);
+  const safeLimit = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 200;
+  return selectMetadataGapRowsStmt.all(safeLimit);
+}
+
+/** Aggregate gap counts shared by the repair sweep and the gaps endpoint. */
+export function getLibraryMetadataGapCounts() {
+  const row = countMetadataGapsStmt.get();
+  return {
+    missingArt: Number(row?.missing_art) || 0,
+    missingMbid: Number(row?.missing_mbid) || 0,
+    total: Number(row?.total) || 0,
+  };
+}
+
+/** Paged gap listing for GET /api/library/metadata-gaps. Read-only. */
+export function listLibraryMetadataGaps({ limit = 100, offset = 0 } = {}) {
+  const parsedLimit = Number(limit);
+  const parsedOffset = Number(offset);
+  const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
+  const safeOffset = Number.isFinite(parsedOffset) && parsedOffset > 0 ? Math.floor(parsedOffset) : 0;
+  return listMetadataGapsStmt.all(safeLimit, safeOffset).map((row) => {
+    const missing = [];
+    if (Number(row.has_embedded_art) === 0 || Number(row.has_sidecar_art) === 0) missing.push("art");
+    if (!normalizeText(row.album_mbid) || !normalizeText(row.release_group_mbid)) {
+      missing.push("albumMbid");
+    }
+    return { path: row.path, missing };
+  });
+}
+
+/**
+ * Raise the cover-art flags after a successful repair fill. MAX() keeps this
+ * fill-only: a flag can never be lowered here, only by a real rescan. This is
+ * the sweep's done-marker, so no full re-parse is needed.
+ */
+export function updateLibraryMediaArtFlags({
+  source,
+  path,
+  hasEmbeddedArt = false,
+  hasSidecarArt = false,
+}) {
+  const mediaSource = normalizeText(source);
+  const filePath = normalizeText(path);
+  if (!mediaSource || !filePath) return false;
+  const embedded = hasEmbeddedArt === true ? 1 : 0;
+  const sidecar = hasSidecarArt === true ? 1 : 0;
+  if (embedded === 0 && sidecar === 0) return false;
+  const changed = updateMediaArtFlagsStmt.run(
+    embedded,
+    sidecar,
+    now(),
+    mediaSource,
+    filePath,
+    embedded,
+    sidecar,
+  ).changes;
+  if (changed > 0) invalidateLibraryCache();
+  return changed > 0;
+}
+
+/**
+ * Fill album/release-group MBIDs on a canonical album row. COALESCE per column
+ * means an existing MBID always wins - the sweep never overwrites identity.
+ */
+export function fillLibraryAlbumMbids({ albumId, mbid = null, releaseGroupMbid = null }) {
+  const id = Number(albumId);
+  const nextMbid = normalizeText(mbid) || null;
+  const nextReleaseGroupMbid = normalizeText(releaseGroupMbid) || null;
+  if (!Number.isSafeInteger(id) || (!nextMbid && !nextReleaseGroupMbid)) return false;
+  const changed = fillAlbumMbidsStmt.run(nextMbid, nextReleaseGroupMbid, now(), id).changes;
+  if (changed === 0) return false;
+  syncLibrarySearchAlbum(id);
+  invalidateLibraryCache();
+  return true;
 }
