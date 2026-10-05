@@ -12,6 +12,7 @@ import {
 } from "./libraryMediaStore.js";
 import { detectSidecarArt } from "./libraryFileScanner.js";
 import { parseAurralIdentityComment } from "./playlistDownloadUtils.js";
+import { sniffImageMimeType } from "./apiClients/coverArtArchive.js";
 import {
   musicbrainzGetRecordingReleases,
   musicbrainzSearchReleaseGroup,
@@ -27,6 +28,11 @@ const YIELD_EVERY_FILES = 25;
 // scanner's SIDECAR_ART_FILENAMES or a written sidecar would never clear the
 // has_sidecar_art gap.
 const SIDECAR_ART_TARGETS = ["cover.jpg", "folder.jpg"];
+
+// ffmpeg codec name per image mime. Mirrors playlistDownloadUtils'
+// COVER_CODEC_BY_MIME so the fallback embedder and the shared `writeAudioCover`
+// produce identical attached-picture streams.
+const COVER_CODEC_BY_MIME = { "image/jpeg": "mjpeg", "image/png": "png" };
 
 const text = (value) => String(value ?? "").trim();
 
@@ -245,7 +251,13 @@ async function embedCoverArtWithFfmpeg(filePath, bytes, { mimeType = "image/jpeg
   const ext = path.extname(sourcePath) || ".m4a";
   const dir = path.dirname(sourcePath);
   const stamp = `${process.pid}-${Date.now()}`;
-  const coverPath = path.join(dir, `.aurral-cover-${stamp}${mimeExtension(mimeType)}`);
+  // Sniffed magic bytes win over the declared mime, exactly as in
+  // writeAudioCover: a resolver can mislabel a payload, and the codec below has
+  // to match what ffmpeg is really being fed.
+  const resolvedMime =
+    sniffImageMimeType(bytes) || text(mimeType).toLowerCase() || "image/jpeg";
+  const codec = COVER_CODEC_BY_MIME[resolvedMime] || "mjpeg";
+  const coverPath = path.join(dir, `.aurral-cover-${stamp}${mimeExtension(resolvedMime)}`);
   const taggedPath = path.join(dir, `.${path.basename(sourcePath, ext)}.${stamp}.art${ext}`);
   await fs.writeFile(coverPath, bytes);
   try {
@@ -267,8 +279,17 @@ async function embedCoverArtWithFfmpeg(filePath, bytes, { mimeType = "image/jpeg
         "1",
         "-c",
         "copy",
-        "-disposition:v",
+        // The audio source has no video stream, so the attached image is v:0.
+        // Without an explicit codec ffmpeg auto-selects one for the picture
+        // stream, which either fails or yields art players will not recognise.
+        "-c:v:0",
+        codec,
+        "-disposition:v:0",
         "attached_pic",
+        "-metadata:s:v:0",
+        "title=Album cover",
+        "-metadata:s:v:0",
+        "comment=Cover (front)",
         taggedPath,
       ],
       { timeout: 120000 },
@@ -307,7 +328,25 @@ const loadDefaultCoverResolver = () => {
 /** Which embedder this run used - reported so the parallel-branch handoff is visible. */
 export async function resolveCoverEmbedder() {
   const shared = await loadCoverWriter();
-  return shared ? { name: "writeAudioCover", embed: shared } : { name: "ffmpeg", embed: embedCoverArtWithFfmpeg };
+  if (!shared) return { name: "ffmpeg", embed: embedCoverArtWithFfmpeg };
+  // `writeAudioCover` is the canonical embedder, but its shape is
+  // (filePath, {bytes, mime}, {embed, sidecar, sidecarDir}) while the fallback
+  // takes (filePath, bytes, {mimeType}). Adapt it so the sweep keeps one call
+  // site, and leave sidecars off: the sweep writes and counts them itself so
+  // the `wx` fill-only accounting lives in exactly one place.
+  // Returns the writer's own verdict - it is best-effort and never throws, so
+  // a skipped or failed embed must not be reported as success.
+  return {
+    name: "writeAudioCover",
+    embed: async (filePath, bytes, { mimeType = null } = {}) => {
+      const result = await shared(
+        filePath,
+        { bytes, mime: mimeType || null },
+        { embed: true, sidecar: false },
+      );
+      return result?.embedded === true;
+    },
+  };
 }
 
 async function resolveCoverBytes(resolver, target) {
@@ -492,11 +531,19 @@ export async function repairMetadataGaps({
           unresolved = true;
         } else {
           if (wantsEmbed) {
-            await embedder.embed(filePath, cover.buffer, { mimeType: cover.mimeType });
-            metrics.artEmbedded += 1;
-            detail.artEmbedded = true;
-            embeddedNow = true;
-            acted = true;
+            // Both embedders report whether art was really attached. The shared
+            // writer is best-effort and never throws, so counting blindly would
+            // raise the store flag and hide the gap with no art in the file.
+            const embedded =
+              (await embedder.embed(filePath, cover.buffer, {
+                mimeType: cover.mimeType,
+              })) === true;
+            if (embedded) {
+              metrics.artEmbedded += 1;
+              detail.artEmbedded = true;
+              embeddedNow = true;
+              acted = true;
+            }
           }
           if (wantsSidecar) {
             const written = await writeSidecarArt(path.dirname(filePath), cover.buffer);

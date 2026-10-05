@@ -125,8 +125,10 @@ export async function probeEmbeddedArt(filePath) {
  * scan's own metadata can never answer this question: re-parse with covers
  * kept and `duration: false`, which is the cheapest reliable signal available.
  *
- * `parse` is injectable and defaults to whatever reader the scan already uses,
- * so tests supplying a fake metadataReader never touch the filesystem twice.
+ * `parse` is injectable for unit tests and defaults to the real tag parser.
+ * The scan deliberately does NOT pass its own `metadataReader` here: that
+ * reader's contract is exactly one call per written file, so routing the cover
+ * re-parse through it would double-count (and double-parse) every file.
  */
 export async function detectEmbeddedArt(filePath, { metadata = null, parse = parseFile } = {}) {
   if (metadataHasPicture(metadata)) return true;
@@ -465,9 +467,12 @@ export async function scanMusicRoot({
             enrichedMetadata,
             filePath,
             resolvedRoot,
+            // Art flags are derived on the write path only. `metadata` gives the
+            // cheap short-circuit; the cover re-parse deliberately uses the real
+            // tag parser instead of `metadataReader`, whose contract is exactly
+            // one call per written file (callers and tests count it).
             await detectArtFlags(filePath, {
               metadata,
-              parse: metadataReader,
               cache: sidecarArtCache,
             }),
           );
