@@ -48,7 +48,7 @@ import {
   isFlowOwnerProcess,
   requestFlowOwner,
 } from "../../../services/weeklyFlow/weeklyFlowOwnerClient.js";
-import { getStats } from "../../../services/downloadDedupService.js";
+import { getReleaseKeys, getStats } from "../../../services/downloadDedupService.js";
 import {
   createManualMissingSearch,
   consumeManualMissingSelection,
@@ -105,6 +105,36 @@ async function runQualityChecksLocally(playlistIds) {
     queued += await runQualityUpgradeCheck({ force: true, playlistId, limit: 500 });
   }
   return queued;
+}
+
+/**
+ * Awaited, best-effort release of flow-owned claim state (issue #13).
+ *
+ * The dedup registries and the tracker's slskd dispatch marks only exist in
+ * the isolated flow worker process, so a web-process route must ask the owner
+ * to release them — clearing the local copy would "release" nothing and leave
+ * the real claim wedging the release forever. The tracker choke point fires
+ * the same release unawaited; this is the idempotent double-cover that
+ * guarantees it landed before the response (and before the worker is woken).
+ *
+ * Never throws: if the flow worker is down its in-memory state dies with it,
+ * and a deny/approve must not turn into a 30s hang or a 500.
+ */
+async function releaseFlowJobState(jobId, options, action) {
+  try {
+    if (isFlowOwnerProcess()) {
+      downloadTracker.releaseJobState(jobId, options);
+    } else {
+      await requestFlowOwner("releaseJobState", [[jobId], options], {
+        timeoutMs: 5000,
+      });
+    }
+  } catch (error) {
+    logger.warn("flow-claims", `Claim release failed during ${action}`, {
+      jobId,
+      error: error?.message || String(error),
+    });
+  }
 }
 
 export function registerJobs(router) {
@@ -429,6 +459,10 @@ export function registerJobs(router) {
     if (!job || job.status !== "blocked") {
       return res.status(404).json({ error: "Blocked job not found" });
     }
+    // Captured up front: the release below uses setDone semantics, which
+    // forget failures for the identities this job was claimed under, and the
+    // job row is rewritten during the commit.
+    const releaseKeys = getReleaseKeys(job);
     const sourcePath = String(job.stagingPath || "").trim();
     if (!sourcePath) {
       return res.status(400).json({ error: "Staging file path missing" });
@@ -470,6 +504,12 @@ export function registerJobs(router) {
       if (committed.cancelled) {
         return res.status(409).json({ error: "Download job was removed" });
       }
+      // setDone semantics: the release landed, so drop its claims AND forget
+      // its recorded failures, otherwise failure memory keeps suppressing the
+      // source until the window expires. Awaited before the response; the wake
+      // nested in finalizePipelineJobSuccess is already covered by the setDone
+      // choke point, which released these same keys first.
+      await releaseFlowJobState(job.id, { forgetFailures: true, releaseKeys }, "approve");
       await classifyQualityJob(downloadTracker.getJob(job.id));
       invalidateRequestsCache();
       res.json({ success: true, path: committed.result });
@@ -500,6 +540,13 @@ export function registerJobs(router) {
       )
       .catch(() => {});
     invalidateRequestsCache();
+    // Release BEFORE waking the worker: waking first lets the flow re-claim
+    // this release, and a release that lands afterwards would drop that fresh
+    // legitimate claim and open a duplicate-download window. Deny never
+    // forgets recorded failures — the track is going straight back in the
+    // queue and failure memory is what stops a known-bad source from being
+    // retried first.
+    await releaseFlowJobState(job.id, {}, "deny");
     weeklyFlowWorker.wake();
     res.json({ success: true });
   });

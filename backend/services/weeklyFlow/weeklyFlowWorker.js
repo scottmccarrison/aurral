@@ -7,7 +7,7 @@ import { buildFlowRunPlanIsolated } from "./weeklyFlowPlanRunner.js";
 import { dbOps, userOps } from "../../db/helpers/index.js";
 import { resolveWeeklyFlowTrackContext } from "./weeklyFlowTrackResolver.js";
 import { getListenHistoryProfile } from "../listeningHistory.js";
-import { safeLogDiagnostic } from "../logger.js";
+import { logger, safeLogDiagnostic } from "../logger.js";
 import {
   normalizeExistingFileMode,
   repairOrphanedPlaylistTrackPaths,
@@ -998,6 +998,14 @@ export class WeeklyFlowWorker {
         if (activePlaylistIds.has(playlistId)) continue;
         set.delete(playlistId);
       }
+    }
+    // Last step: heal the flow-owned claim state itself (issue #13). This runs
+    // in the flow owner, so it sees the real dedup registries and dispatch
+    // marks — a release that never arrived (web-process transition, worker
+    // restart) stops blocking its release forever once the claim goes stale.
+    const reconciled = downloadTracker.reconcileJobState();
+    if (reconciled.claimsReaped > 0 || reconciled.dispatchedCleared > 0) {
+      logger.info("flow-claims", "Reconciled orphaned download claim state", reconciled);
     }
   }
 
