@@ -18,7 +18,7 @@ function sendRequest({
   const req = {
     method,
     baseUrl,
-    route: route ? { path: route } : undefined,
+    route: route !== null && route !== undefined ? { path: route } : undefined,
     path,
   };
 
@@ -190,16 +190,17 @@ test("endpoint uses route pattern when req.route.path exists, falls back to req.
   });
   assert.equal(events1[0][3].endpoint, "/api/playlists/:id/sync");
 
-  // Without route (fallback to path)
+  // Without route (fallback to path) — route: null bypasses the default
   const events2 = sendRequest({
     path: "/api/fallback/test",
     baseUrl: "",
-    route: undefined,
+    route: null,
     status: 200,
     durationMs: 50,
     method: "GET",
   });
-  assert.equal(events2.length, 0); // non-API path, so not logged
+  assert.equal(events2.length, 1); // /api path, so logged
+  assert.equal(events2[0][3].endpoint, "/api/fallback/test");
 });
 
 test("slow /rest requests also emit Slow request warning", () => {
@@ -216,4 +217,66 @@ test("slow /rest requests also emit Slow request warning", () => {
   assert.equal(events[0][2], "Request completed");
   assert.equal(events[1][0], "warn");
   assert.equal(events[1][2], "Slow request");
+});
+
+test("bare /api endpoint logs exactly 1 event", () => {
+  const events = sendRequest({
+    path: "/api",
+    baseUrl: "",
+    route: null,
+    status: 200,
+    durationMs: 50,
+    method: "GET",
+  });
+  assert.equal(events.length, 1);
+  assert.equal(events[0][0], "info");
+  assert.equal(events[0][1], "http");
+  assert.equal(events[0][2], "Request completed");
+  assert.deepEqual(events[0][3], {
+    method: "GET",
+    endpoint: "/api",
+    status: 200,
+    durationMs: 50,
+  });
+});
+
+test("logger stub that throws does not propagate exception and calls next()", () => {
+  const events = [];
+  const res = new EventEmitter();
+  res.statusCode = 200;
+  const req = {
+    method: "GET",
+    baseUrl: "/api",
+    route: { path: "/test" },
+    path: "/api/test",
+  };
+
+  const originalDateNow = Date.now;
+  let callCount = 0;
+  Date.now = () => {
+    callCount++;
+    if (callCount === 1) return 1000;
+    return 1100;
+  };
+
+  let nextCalled = false;
+  const throwingLogger = {
+    info: () => { throw new Error("Logger error"); },
+    debug: () => { throw new Error("Logger error"); },
+    warn: () => { throw new Error("Logger error"); },
+    error: () => { throw new Error("Logger error"); },
+  };
+
+  try {
+    const middleware = createRequestTimingLogger(throwingLogger);
+    middleware(req, res, () => { nextCalled = true; });
+
+    // Emit finish — should not throw
+    res.emit("finish");
+    
+    assert.equal(nextCalled, true, "next() should have been called");
+    assert.equal(events.length, 0, "No events should leak");
+  } finally {
+    Date.now = originalDateNow;
+  }
 });

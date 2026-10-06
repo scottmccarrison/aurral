@@ -248,7 +248,7 @@ function ensureRunSchema() {
         error = ?,
         ended_at = ?,
         duration_ms = ?
-    WHERE id = ?
+    WHERE id = ? AND status = 'running'
   `);
   pruneRunsStatement = db.prepare(`
     DELETE FROM honker_task_runs
@@ -1129,7 +1129,7 @@ export function recordHonkerTaskRunFinished(runId, status, error = null) {
     const durationMs = row?.started_at
       ? Math.max(0, (endedAt - Number(row.started_at)) * 1000)
       : null;
-    updateRunStatement.run(
+    const info = updateRunStatement.run(
       status || "completed",
       error ? String(error).slice(0, 2000) : null,
       endedAt,
@@ -1137,9 +1137,10 @@ export function recordHonkerTaskRunFinished(runId, status, error = null) {
       id,
     );
     
-    // Emit logs unless this is a force-failed-by-clear run
+    // Emit logs only if the update actually changed a row (info.changes > 0)
+    // and unless this is a force-failed-by-clear run
     const isClearedRun = error === CLEAR_STALE_REASON;
-    if (!isClearedRun && row) {
+    if (info.changes > 0 && !isClearedRun && row) {
       logger.info("task-run", "Task finished", {
         name: row.name,
         queue: row.queue,

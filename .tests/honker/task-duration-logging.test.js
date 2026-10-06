@@ -254,3 +254,87 @@ test("task-run-watchdog case dispatches in systemTaskWorker", async (t) => {
   const stuckTaskLog = warns.find(([, message]) => message === "Stuck task running");
   assert.ok(stuckTaskLog, "Stuck task running warn should be emitted from task-run-watchdog");
 });
+
+test("second recordHonkerTaskRunFinished on already-finished run does NOT change status/error and emits NO logs", async (t) => {
+  const infos = [];
+  const warns = [];
+  t.mock.method(logger, "info", (...args) => infos.push(args));
+  t.mock.method(logger, "warn", (...args) => warns.push(args));
+
+  // Insert a run record with a past started_at
+  const startedAt = Math.floor(Date.now() / 1000) - 30;
+  const runId = db.prepare(`
+    INSERT INTO honker_task_runs (
+      job_id,
+      queue,
+      name,
+      payload,
+      worker_id,
+      attempt,
+      status,
+      started_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    RETURNING id
+  `).get(999, "library-scan", "Test Task", "{}", "worker-1", 1, "running", startedAt).id;
+
+  // First finish: should emit logs
+  taskStatus.recordHonkerTaskRunFinished(runId, "completed");
+  const firstFinishedLog = infos.find(([, message]) => message === "Task finished");
+  assert.ok(firstFinishedLog, "First finish should emit Task finished log");
+  const firstInfoCount = infos.length;
+  const firstWarnCount = warns.length;
+
+  // Second finish: should NOT emit any logs
+  taskStatus.recordHonkerTaskRunFinished(runId, "failed", "Some error");
+  const secondFinishedLog = infos.slice(firstInfoCount).find(([, message]) => message === "Task finished");
+  assert.equal(secondFinishedLog, undefined, "Second finish should NOT emit Task finished log");
+  
+  // Verify no new logs were added
+  assert.equal(infos.length, firstInfoCount, "No new info logs should be emitted on second finish");
+  assert.equal(warns.length, firstWarnCount, "No new warn logs should be emitted on second finish");
+
+  // Verify the run status is still 'completed' (not changed to 'failed')
+  const row = db.prepare("SELECT status, error FROM honker_task_runs WHERE id = ?").get(runId);
+  assert.equal(row.status, "completed", "Status should remain 'completed'");
+  assert.equal(row.error, null, "Error should remain null");
+});
+
+test("run force-failed via clearStaleHonkerJobs that is then 'finished' by job remains failed with clear reason and logs nothing extra", async (t) => {
+  const infos = [];
+  const warns = [];
+  t.mock.method(logger, "info", (...args) => infos.push(args));
+  t.mock.method(logger, "warn", (...args) => warns.push(args));
+
+  // Insert a run record with a past started_at
+  const startedAt = Math.floor(Date.now() / 1000) - 30;
+  const runId = db.prepare(`
+    INSERT INTO honker_task_runs (
+      job_id,
+      queue,
+      name,
+      payload,
+      worker_id,
+      attempt,
+      status,
+      started_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    RETURNING id
+  `).get(999, "library-scan", "Test Task", "{}", "worker-1", 1, "running", startedAt).id;
+
+  // First: force-fail with CLEAR_STALE_REASON (simulating clearStaleHonkerJobs)
+  taskStatus.recordHonkerTaskRunFinished(runId, "failed", "Cleared stuck background job");
+  const firstInfoCount = infos.length;
+  const firstWarnCount = warns.length;
+
+  // Second: job tries to finish normally (should be no-op)
+  taskStatus.recordHonkerTaskRunFinished(runId, "completed");
+  
+  // Verify no new logs were added
+  assert.equal(infos.length, firstInfoCount, "No new info logs should be emitted on second finish");
+  assert.equal(warns.length, firstWarnCount, "No new warn logs should be emitted on second finish");
+
+  // Verify the run status is still 'failed' with the clear reason
+  const row = db.prepare("SELECT status, error FROM honker_task_runs WHERE id = ?").get(runId);
+  assert.equal(row.status, "failed", "Status should remain 'failed'");
+  assert.equal(row.error, "Cleared stuck background job", "Error should remain the clear reason");
+});
