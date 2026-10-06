@@ -66,6 +66,16 @@ const DEFAULT_VISIBLE_MESSAGES = [
   /Unhandled Rejection:/,
   /Server error:/,
   /Playlist import (queued|job completed|sync completed)/,
+  /^Request completed$/,
+  /^Slow request$/,
+  /^Task finished$/,
+  /^Slow task$/,
+  /^Cleared stuck task$/,
+  /^Stuck task running$/,
+  /^Scheduled refresh skipped/,
+  /^Job deferred$/,
+  /^Jobs deferred$/,
+  /^Timed out waiting for lock$/,
 ];
 
 const messageText = (args) =>
