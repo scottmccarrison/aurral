@@ -331,7 +331,7 @@ export async function evaluateTrackCandidates({
     .sort((left, right) => left.distance - right.distance);
   const proposal = proposalRecommendation(
     scored.map((evaluation) => evaluation.distance),
-    thresholds,
+    finalThresholds,
   );
 
   // Best-vs-runner-up separation is mandatory for acceptance. The runner-up
@@ -376,7 +376,7 @@ export async function evaluateTrackCandidates({
     decision: rankableBest?.decision || "reject",
     recommendation: proposal,
     gap,
-    thresholds,
+    thresholds: finalThresholds,
     bestCandidateIndex: rankableBest?.candidateIndex ?? null,
     runnerUpCandidateIndex: runnerUp?.candidateIndex ?? null,
   };
@@ -397,7 +397,7 @@ export async function evaluateTrackCandidates({
     decision: summary.decision,
     recommendation: proposal,
     gap,
-    thresholds,
+    thresholds: finalThresholds,
     request: trackRequest,
     candidates: normalized,
     evaluations: orderedEvaluations,

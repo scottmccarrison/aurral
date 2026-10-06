@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   getMatcherScriptPath,
   isBeetsMatcherAvailable,
@@ -18,6 +19,15 @@ resetMatcherAvailability();
 const beetsAvailable = await isBeetsMatcherAvailable();
 
 const skipReason = beetsAvailable ? false : "beets not installed for any available Python interpreter";
+
+const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "matcher");
+const stub = (name) => join(fixturesDir, name);
+
+// The stub matcher only needs python3 (gate mirrors beets-client.test.js).
+const hasSystemPython = (() => {
+  const probe = spawnSync("python3", ["-c", "print(1)"], { timeout: 5000 });
+  return probe.status === 0;
+})();
 
 const GET_LUCKY = {
   artistName: "Daft Punk",
@@ -296,6 +306,65 @@ test("candidates rejected by semantic policy do not invoke the matcher", async (
   assert.equal(evaluation.summary.decision, "reject");
   assert.equal(evaluation.evaluations[0].decision, "reject");
   assert.equal(evaluation.error, undefined);
+});
+
+// Regression for the production ReferenceError at decisionEngine.js:334
+// ("thresholds is not defined"): once the matcher succeeds with ≥2 scored
+// candidates, the proposal/runner-up path must run with the merged
+// thresholds in scope. Beets-free harness mirrors album-version-matching
+// .test.js: python3 + stub_ok.py answer track_distance via
+// STUB_MATCHER_RESPONSE (protocol: 1 is mandatory, beetsClient.js:164).
+test("multi-candidate scoring returns a recommendation with merged thresholds in scope", { skip: hasSystemPython ? false : "python3 unavailable" }, async () => {
+  const previousStub = process.env.STUB_MATCHER_RESPONSE;
+  process.env.STUB_MATCHER_RESPONSE = JSON.stringify({
+    ok: true,
+    protocol: 1,
+    operation: "track_distance",
+    beetsVersion: "stub-1.0.0",
+    // Two scored candidates: a strong best (0.01) and a distinct runner-up
+    // (0.30), so proposalRecommendation and the best-vs-runner-up separation
+    // both execute.
+    matches: [
+      { candidateIndex: 0, distance: 0.01, maxDistance: 1, rawDistance: 0.01, penalties: { track_title: 0, track_artist: 0 } },
+      { candidateIndex: 1, distance: 0.3, maxDistance: 1, rawDistance: 0.3, penalties: { track_title: 0.2, track_artist: 0.1 } },
+    ],
+    thresholds: { strongRecThresh: 0.04, mediumRecThresh: 0.25, recGapThresh: 0.25 },
+  });
+  try {
+    const evaluation = await evaluateTrackCandidates({
+      source: "deemix",
+      context: GET_LUCKY,
+      candidates: [
+        { id: "exact", title: "Get Lucky", artist: "Daft Punk", album: "Random Access Memories", durationSec: 248 },
+        { id: "near-artist", title: "Get Lucky (feat. Pharrell Williams)", artist: "Daft Punk feat. Pharrell Williams", durationSec: 248 },
+      ],
+      settings: { matching: { autoApproveDistance: 0.2 } },
+      options: {
+        pythonPath: "python3",
+        scriptPath: stub("stub_ok.py"),
+        timeoutMs: 10000,
+      },
+    });
+    // Before the fix this call threw ReferenceError: thresholds is not defined.
+    assert.notEqual(evaluation.decision, "error");
+    assert.equal(evaluation.decision, "accept");
+    // 0.01 < strongRecThresh (0.04) → the proposal path ran with the merged
+    // thresholds and produced a recommendation.
+    assert.equal(evaluation.recommendation, "strong");
+    assert.equal(evaluation.summary.recommendation, "strong");
+    // Both candidates were scored and the runner-up separation was measured.
+    assert.equal(evaluation.summary.bestCandidateIndex, 0);
+    assert.equal(evaluation.summary.runnerUpCandidateIndex, 1);
+    assert.equal(evaluation.gap, 0.29);
+    // The exposed thresholds are the merged ones: matcher/default keys plus
+    // the settings.matching override.
+    assert.equal(evaluation.thresholds.strongRecThresh, 0.04);
+    assert.equal(evaluation.thresholds.autoApproveDistance, 0.2);
+    assert.deepEqual(evaluation.summary.thresholds, evaluation.thresholds);
+  } finally {
+    if (previousStub === undefined) delete process.env.STUB_MATCHER_RESPONSE;
+    else process.env.STUB_MATCHER_RESPONSE = previousStub;
+  }
 });
 
 test("canonical track request normalization is stable for the corpus", () => {
