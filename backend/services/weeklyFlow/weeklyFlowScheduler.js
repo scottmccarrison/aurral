@@ -4,6 +4,7 @@ import { flowPlaylistConfig } from "./weeklyFlowPlaylistConfig.js";
 import { isAnyDownloadSourceConfigured } from "../downloadSourceService.js";
 import { weeklyFlowOperationQueue } from "./weeklyFlowOperationQueue.js";
 import { userOps } from "../../db/helpers/index.js";
+import { logger } from "../logger.js";
 import {
   createWeeklyFlowOperationToken,
   markLatestWeeklyFlowOperationToken,
@@ -17,13 +18,60 @@ function isFlowOwnerActive(flow) {
 }
 
 export async function runScheduledRefresh() {
-  if (!isAnyDownloadSourceConfigured()) return;
+  if (!isAnyDownloadSourceConfigured()) {
+    logger.info("flow-schedule", "Scheduled refresh skipped: no download source configured");
+    return;
+  }
 
   const due = flowPlaylistConfig.getDueForRefresh();
-  if (due.length === 0) return;
+  if (due.length === 0) {
+    logger.info("flow-schedule", "Scheduled refresh skipped: no flows due");
+    // Log skip reasons for non-due flows
+    const skipReasons = flowPlaylistConfig.getScheduledRefreshSkipReasons();
+    for (const entry of skipReasons) {
+      if (entry.reason === "disabled" || entry.reason === "missing-next-run") {
+        logger.info("flow-schedule", `Scheduled refresh skipped: ${entry.reason}`, {
+          flowId: entry.flowId,
+          reason: entry.reason,
+          nextRunAt: entry.nextRunAt,
+        });
+      } else if (entry.reason === "not-due") {
+        logger.debug("flow-schedule", `Scheduled refresh skipped: ${entry.reason}`, {
+          flowId: entry.flowId,
+          reason: entry.reason,
+          nextRunAt: entry.nextRunAt,
+        });
+      }
+    }
+    return;
+  }
+
+  // Log skip reasons for non-due flows (once per tick, before processing due flows)
+  const skipReasons = flowPlaylistConfig.getScheduledRefreshSkipReasons();
+  for (const entry of skipReasons) {
+    if (entry.reason === "disabled" || entry.reason === "missing-next-run") {
+      logger.info("flow-schedule", `Scheduled refresh skipped: ${entry.reason}`, {
+        flowId: entry.flowId,
+        reason: entry.reason,
+        nextRunAt: entry.nextRunAt,
+      });
+    } else if (entry.reason === "not-due") {
+      logger.debug("flow-schedule", `Scheduled refresh skipped: ${entry.reason}`, {
+        flowId: entry.flowId,
+        reason: entry.reason,
+        nextRunAt: entry.nextRunAt,
+      });
+    }
+  }
 
   for (const flow of due) {
-    if (!isFlowOwnerActive(flow)) continue;
+    if (!isFlowOwnerActive(flow)) {
+      logger.info("flow-schedule", "Scheduled refresh skipped: inactive owner", {
+        flowId: flow.id,
+        ownerUserId: flow.ownerUserId,
+      });
+      continue;
+    }
     try {
       const token = createWeeklyFlowOperationToken();
       const tokenScope = `flow:${flow.id}:scheduled`;
@@ -36,7 +84,10 @@ export async function runScheduledRefresh() {
         token,
       });
     } catch (error) {
-      console.error(`[WeeklyFlowScheduler] Failed to refresh ${flow.id}:`, error.message);
+      logger.error("flow-schedule", "Scheduled refresh failed", {
+        flowId: flow.id,
+        error: error.message,
+      });
     }
   }
 }
