@@ -183,3 +183,45 @@ test("regular server console suppresses raw routine output", () => {
   assert.match(output, /Server running on port 3001/);
   assert.match(output, /important warning/);
 });
+
+test("shouldEmitDefaultConsoleMessage matches composed console args (regression for issue #17)", async () => {
+  const { shouldEmitDefaultConsoleMessage } = await import(
+    `../../backend/services/logger.js?regression-test=${Date.now()}`
+  );
+
+  // Regression: composed args from logger.info("http", "Request completed", {...})
+  // becomes console.log("%s", "[info] [http] Request completed", {...})
+  assert.equal(
+    shouldEmitDefaultConsoleMessage("log", ["%s", "[info] [http] Request completed", { method: "GET", endpoint: "/api/settings", status: 200, durationMs: 5 }]),
+    true,
+    "Request completed in composed args should match",
+  );
+
+  // Task finished composed line
+  assert.equal(
+    shouldEmitDefaultConsoleMessage("log", ["%s", "[info] [workers] Task finished", { taskId: "abc123", durationMs: 1000 }]),
+    true,
+    "Task finished in composed args should match",
+  );
+
+  // Scheduled refresh skipped with suffix
+  assert.equal(
+    shouldEmitDefaultConsoleMessage("log", ["%s", "[info] [scheduler] Scheduled refresh skipped: no flows due", {}]),
+    true,
+    "Scheduled refresh skipped in composed args should match",
+  );
+
+  // Negative: unrelated message should not match
+  assert.equal(
+    shouldEmitDefaultConsoleMessage("log", ["%s", "[info] [http] Something else", {}]),
+    false,
+    "Unrelated message should not match",
+  );
+
+  // Negative: debug level should always be suppressed
+  assert.equal(
+    shouldEmitDefaultConsoleMessage("debug", ["%s", "[debug] [http] Request completed", {}]),
+    false,
+    "Debug level should always be suppressed",
+  );
+});
