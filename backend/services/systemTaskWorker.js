@@ -228,6 +228,11 @@ export async function processSystemTask(payload = {}, job = null) {
       }
       return;
     }
+    case "task-run-watchdog": {
+      const { clearStaleHonkerJobs } = await import("./honkerTaskStatus.js");
+      await clearStaleHonkerJobs();
+      return;
+    }
     default:
       throw new Error(`Unknown system task: ${kind || "unknown"}`);
   }
