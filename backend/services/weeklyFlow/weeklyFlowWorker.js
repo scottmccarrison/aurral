@@ -721,16 +721,23 @@ export class WeeklyFlowWorker {
                 reason = "worker-stopped";
               } else if (this._isPlaylistBlocked(job.playlistType)) {
                 reason = "playlist-blocked";
-              } else if (this._isControlFlowError(error)) {
-                const code = String(error?.code || "");
-                if (code === "WORKER_STOPPED_CODE") {
-                  reason = "worker-stopped";
-                } else if (code === "PLAYLIST_MUTATION_CODE") {
-                  reason = "playlist-blocked";
-                } else {
-                  reason = error.code || "control-flow";
-                }
-              }
+               } else if (this._isControlFlowError(error)) {
+                 const code = String(error?.code || "");
+                 if (code === WORKER_STOPPED_CODE) {
+                   reason = "worker-stopped";
+                 } else if (code === PLAYLIST_MUTATION_CODE) {
+                   // Distinguish between playlist-blocked and owner-inactive
+                   // Both throw PLAYLIST_MUTATION_CODE, but owner-inactive comes from
+                   // _assertJobCanContinue when the blocked predicate did NOT fire
+                   if (this._isPlaylistBlocked(job.playlistType)) {
+                     reason = "playlist-blocked";
+                   } else {
+                     reason = "owner-inactive";
+                   }
+                 } else {
+                   reason = error.code || "control-flow";
+                 }
+               }
               logger.info("flow-schedule", "Job deferred", {
                 jobId: job.id,
                 playlistType: job.playlistType,
