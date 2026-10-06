@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import { createRequestTimingLogger } from "../../backend/middleware/requestTimingLogger.js";
+import { logger } from "../../backend/services/logger.js";
 
 function sendRequest({
   path = "/api/test",
@@ -278,5 +279,75 @@ test("logger stub that throws does not propagate exception and calls next()", ()
     assert.equal(events.length, 0, "No events should leak");
   } finally {
     Date.now = originalDateNow;
+  }
+});
+
+test("Request completed passes through the real logger filter in non-verbose mode", async () => {
+  const output = [];
+  const original = {
+    log: console.log,
+    error: console.error,
+    warn: console.warn,
+  };
+  console.log = (...args) => output.push(["log", ...args]);
+  console.error = (...args) => output.push(["error", ...args]);
+  console.warn = (...args) => output.push(["warn", ...args]);
+
+  try {
+    // Ensure non-verbose mode
+    const previousVerboseLogs = process.env.AURRAL_VERBOSE_LOGS;
+    delete process.env.AURRAL_VERBOSE_LOGS;
+
+    // Import a fresh logger instance to pick up the env change
+    const { logger: freshLogger } = await import(
+      `../../backend/services/logger.js?real-filter-test=${Date.now()}`
+    );
+
+    // Create middleware with REAL logger
+    const middleware = createRequestTimingLogger(freshLogger);
+
+    // Simulate a request to /api/settings
+    const res = new EventEmitter();
+    res.statusCode = 200;
+    const req = {
+      method: "GET",
+      baseUrl: "/api",
+      route: { path: "/settings" },
+      path: "/api/settings",
+    };
+
+    // Mock Date.now
+    const originalDateNow = Date.now;
+    let callCount = 0;
+    Date.now = () => {
+      callCount++;
+      if (callCount === 1) return 1000;
+      return 1005; // 5ms duration
+    };
+
+    try {
+      middleware(req, res, () => {});
+      res.emit("finish");
+    } finally {
+      Date.now = originalDateNow;
+    }
+
+    // Verify that "Request completed" was emitted through the real logger filter
+    const hasRequestCompleted = output.some((entry) =>
+      entry.slice(1).join(" ").includes("Request completed")
+    );
+    assert.equal(
+      hasRequestCompleted,
+      true,
+      "Request completed should pass through the real logger filter and appear in console output"
+    );
+
+    // Restore env
+    if (previousVerboseLogs === undefined) delete process.env.AURRAL_VERBOSE_LOGS;
+    else process.env.AURRAL_VERBOSE_LOGS = previousVerboseLogs;
+  } finally {
+    console.log = original.log;
+    console.error = original.error;
+    console.warn = original.warn;
   }
 });
