@@ -14,16 +14,27 @@ const normalizePlaylistTypes = (playlistTypes) => [
 
 async function withPlaylistLocks(playlistTypes, operation) {
   const sortedTypes = [...playlistTypes].sort();
+  const waitTimeoutMs = 15 * 60 * 1000;
   const runAtIndex = async (index) => {
     if (index >= sortedTypes.length) {
       return operation();
     }
     const playlistType = sortedTypes[index];
-    return withHonkerLock(`playlist-mutation:${playlistType}`, () => runAtIndex(index + 1), {
-      ttlSeconds: 180,
-      waitTimeoutMs: 15 * 60 * 1000,
-      retryDelayMs: 250,
-    });
+    try {
+      return await withHonkerLock(`playlist-mutation:${playlistType}`, () => runAtIndex(index + 1), {
+        ttlSeconds: 180,
+        waitTimeoutMs,
+        retryDelayMs: 250,
+      });
+    } catch (error) {
+      if (String(error?.message || "").includes("Timed out waiting for Honker lock")) {
+        logger.warn("flow-schedule", "Timed out waiting for lock", {
+          playlistType,
+          waitTimeoutMs,
+        });
+      }
+      throw error;
+    }
   };
   return runAtIndex(0);
 }

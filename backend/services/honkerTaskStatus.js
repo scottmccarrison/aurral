@@ -1,5 +1,6 @@
 import { db } from "../config/db-sqlite.js";
 import { SCHEDULED_SYSTEM_TASKS } from "./honkerDb.js";
+import { logger } from "./logger.js";
 
 export const QUEUE_DEFINITIONS = [
   {
@@ -146,6 +147,9 @@ export const HONKER_QUEUE_NAMES = QUEUE_DEFINITIONS.map((definition) => definiti
 
 const RUN_LEDGER_MAX_AGE_MS = 60 * 60 * 1000;
 const STALE_RUNNING_MS = 60 * 60 * 1000;
+const SLOW_TASK_MS = 60 * 1000;
+const STUCK_TASK_WARN_MS = 10 * 60 * 1000;
+const CLEAR_STALE_REASON = "Cleared stuck background job";
 const LIVE_JOB_LIMIT = 500;
 const DEAD_JOB_LIMIT = 50;
 
@@ -244,7 +248,7 @@ function ensureRunSchema() {
         error = ?,
         ended_at = ?,
         duration_ms = ?
-    WHERE id = ?
+    WHERE id = ? AND status = 'running'
   `);
   pruneRunsStatement = db.prepare(`
     DELETE FROM honker_task_runs
@@ -274,6 +278,7 @@ async function pruneExpiredRuns() {
       "./discovery/refreshScheduler.js"
     );    pruneDuplicateScheduledDiscoveryRefreshes();
   } catch {}
+  warnStuckHonkerRuns();
 }
 
 function isActiveQueueRow(row) {
@@ -1119,20 +1124,70 @@ export function recordHonkerTaskRunFinished(runId, status, error = null) {
     ensureRunSchema();
     const id = Number(runId);
     if (!Number.isFinite(id) || id <= 0) return;
-    const row = safeGet("SELECT started_at FROM honker_task_runs WHERE id = ?", [id]);
+    const row = safeGet("SELECT started_at, name, queue, attempt FROM honker_task_runs WHERE id = ?", [id]);
     const endedAt = nowUnix();
     const durationMs = row?.started_at
       ? Math.max(0, (endedAt - Number(row.started_at)) * 1000)
       : null;
-    updateRunStatement.run(
+    const info = updateRunStatement.run(
       status || "completed",
       error ? String(error).slice(0, 2000) : null,
       endedAt,
       durationMs,
       id,
     );
+    
+    // Emit logs only if the update actually changed a row (info.changes > 0)
+    // and unless this is a force-failed-by-clear run
+    const isClearedRun = error === CLEAR_STALE_REASON;
+    if (info.changes > 0 && !isClearedRun && row) {
+      logger.info("task-run", "Task finished", {
+        name: row.name,
+        queue: row.queue,
+        status: status || "completed",
+        durationMs,
+        attempt: row.attempt,
+      });
+      if (durationMs > SLOW_TASK_MS) {
+        logger.warn("task-run", "Slow task", {
+          name: row.name,
+          queue: row.queue,
+          status: status || "completed",
+          durationMs,
+          attempt: row.attempt,
+        });
+      }
+    }
+    
     void pruneExpiredRuns();
   } catch {}
+}
+
+export function warnStuckHonkerRuns() {
+  ensureRunSchema();
+  const now = nowUnix();
+  const stuckWarnCutoff = now - Math.floor(STUCK_TASK_WARN_MS / 1000);
+  const staleCutoff = now - Math.floor(STALE_RUNNING_MS / 1000);
+  
+  const stuckRows = safeQuery(
+    `
+      SELECT id, name, queue, started_at
+      FROM honker_task_runs
+      WHERE status = 'running'
+        AND started_at < ?
+        AND started_at >= ?
+    `,
+    [stuckWarnCutoff, staleCutoff],
+  );
+  
+  for (const row of stuckRows) {
+    const ageMs = (now - Number(row.started_at)) * 1000;
+    logger.warn("task-run", "Stuck task running", {
+      name: row.name,
+      queue: row.queue,
+      ageMs,
+    });
+  }
 }
 
 export async function clearStaleHonkerJobs() {
@@ -1141,7 +1196,6 @@ export async function clearStaleHonkerJobs() {
   const honkerDb = getHonkerDb();
   const now = nowUnix();
   const staleCutoff = now - Math.floor(STALE_RUNNING_MS / 1000);
-  const clearedReason = "Cleared stuck background job";
 
   let swept = sweepAllHonkerQueues();
   let cleared = 0;
@@ -1150,7 +1204,7 @@ export async function clearStaleHonkerJobs() {
   const staleRows = honkerDb.query(
     `
       SELECT live.id, live.queue, live.worker_id, live.state, live.created_at,
-             runs.id AS run_id, runs.started_at
+             runs.id AS run_id, runs.started_at, runs.name
       FROM _honker_live live
       LEFT JOIN honker_task_runs runs
         ON runs.job_id = live.id
@@ -1171,7 +1225,13 @@ export async function clearStaleHonkerJobs() {
       queue.cancel(row.id);
 
       if (row.run_id) {
-        recordHonkerTaskRunFinished(Number(row.run_id), "failed", clearedReason);
+        const ageMs = (now - Number(row.started_at)) * 1000;
+        logger.warn("task-run", "Cleared stuck task", {
+          name: row.name,
+          queue: row.queue,
+          ageMs,
+        });
+        recordHonkerTaskRunFinished(Number(row.run_id), "failed", CLEAR_STALE_REASON);
       }
       cleared += 1;
     } catch (error) {
@@ -1185,7 +1245,7 @@ export async function clearStaleHonkerJobs() {
 
   const orphanRuns = honkerDb.query(
     `
-      SELECT runs.id
+      SELECT runs.id, runs.name, runs.queue, runs.started_at
       FROM honker_task_runs runs
       LEFT JOIN _honker_live live
         ON live.id = runs.job_id
@@ -1199,7 +1259,13 @@ export async function clearStaleHonkerJobs() {
 
   for (const run of orphanRuns) {
     try {
-      recordHonkerTaskRunFinished(Number(run.id), "failed", clearedReason);
+      const ageMs = (now - Number(run.started_at)) * 1000;
+      logger.warn("task-run", "Cleared stuck task", {
+        name: run.name,
+        queue: run.queue,
+        ageMs,
+      });
+      recordHonkerTaskRunFinished(Number(run.id), "failed", CLEAR_STALE_REASON);
       cleared += 1;
     } catch (error) {
       errors.push({
@@ -1209,6 +1275,9 @@ export async function clearStaleHonkerJobs() {
       });
     }
   }
+
+  // Warn about stuck tasks that haven't been cleared yet
+  warnStuckHonkerRuns();
 
   return { swept, cleared, errors };
 }

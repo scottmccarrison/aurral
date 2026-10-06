@@ -893,6 +893,32 @@ export const flowPlaylistConfig = {
     );
   },
 
+  getScheduledRefreshSkipReasons() {
+    const now = Date.now();
+    const dueIds = new Set(
+      getStoredFlows()
+        .filter((flow) => flow.enabled === true && flow.nextRunAt != null && flow.nextRunAt <= now)
+        .map((flow) => flow.id),
+    );
+    return getStoredFlows()
+      .filter((flow) => !dueIds.has(flow.id))
+      .map((flow) => {
+        let reason;
+        if (flow.enabled !== true) {
+          reason = "disabled";
+        } else if (flow.nextRunAt == null) {
+          reason = "missing-next-run";
+        } else {
+          reason = "not-due";
+        }
+        return {
+          flowId: flow.id,
+          reason,
+          nextRunAt: flow.nextRunAt,
+        };
+      });
+  },
+
   getSharedPlaylists() {
     return getStoredSharedPlaylists();
   },

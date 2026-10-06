@@ -11,6 +11,7 @@ dns.setDefaultResultOrder("ipv4first");
 
 import { authMiddleware, isProxyAuthEnabled } from "./middleware/auth.js";
 import { createRequestFailureLogger } from "./middleware/requestFailureLogger.js";
+import { createRequestTimingLogger } from "./middleware/requestTimingLogger.js";
 import { handleOidcCallback, isOidcEnabled } from "./services/oidcAuth.js";
 import { handleGoogleCallback } from "./services/googleAuth.js";
 import { logger } from "./services/logger.js";
@@ -145,6 +146,7 @@ if (process.env.OIDC_DOMAIN) {
 
 app.use(corsMiddleware);
 app.use(createRequestFailureLogger());
+app.use(createRequestTimingLogger());
 app.use(
   helmet({
     contentSecurityPolicy: {
