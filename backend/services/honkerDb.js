@@ -151,6 +151,12 @@ export const SCHEDULED_SYSTEM_TASKS = [
     schedule: "@every 6h",
     payload: { kind: "metadata-repair-sweep" },
   },
+  {
+    name: "task-run-watchdog",
+    queue: "system-task-maintenance",
+    schedule: "@every 5m",
+    payload: { kind: "task-run-watchdog" },
+  },
 ];
 
 const PIPELINE_PHASE_PRIORITY = {
