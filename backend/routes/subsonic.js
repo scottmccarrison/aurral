@@ -416,6 +416,9 @@ async function handleSubsonicRequest(req, res) {
       if (error?.code === "SHARED_PLAYLIST_NAME_CONFLICT") {
         return sendError(res, format, 50, error.message);
       }
+      if (error?.status === 409) {
+        return sendError(res, format, 0, error.message || "Failed to update playlist");
+      }
       return sendError(res, format, 0, "Failed to update playlist");
     }
   }
@@ -474,6 +477,9 @@ async function handleSubsonicRequest(req, res) {
     } catch (error) {
       if (error?.code === "SHARED_PLAYLIST_NAME_CONFLICT") {
         return sendError(res, format, 50, error.message);
+      }
+      if (error?.status === 409) {
+        return sendError(res, format, 0, error.message || "Failed to update playlist");
       }
       return sendError(res, format, 0, "Failed to update playlist");
     }

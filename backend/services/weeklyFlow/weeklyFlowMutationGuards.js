@@ -12,9 +12,9 @@ const normalizePlaylistTypes = (playlistTypes) => [
   ),
 ];
 
-async function withPlaylistLocks(playlistTypes, operation) {
+async function withPlaylistLocks(playlistTypes, operation, options = {}) {
   const sortedTypes = [...playlistTypes].sort();
-  const waitTimeoutMs = 15 * 60 * 1000;
+  const waitTimeoutMs = options.waitTimeoutMs ?? 15 * 60 * 1000;
   const runAtIndex = async (index) => {
     if (index >= sortedTypes.length) {
       return operation();
@@ -32,6 +32,13 @@ async function withPlaylistLocks(playlistTypes, operation) {
           playlistType,
           waitTimeoutMs,
         });
+        // Saves during seed/cleanup/run-start will 409 quickly BY DESIGN.
+        // The lock is held across slow operations like beginPlaylistMutation's RPC +
+        // waitForPlaylistIdle and runFlowSeed's weeklyReset/seeding.
+        const err = new Error("Another flow operation is in progress (a run may be starting or finishing) — try again in a few seconds.");
+        err.status = 409;
+        err.cause = error;
+        throw err;
       }
       throw error;
     }
@@ -99,12 +106,12 @@ export async function withPlaylistMutation(playlistTypes, operation, options = {
     } finally {
       await releaseMutation();
     }
-  });
+  }, options);
 }
 
-export async function withPlaylistMutationLock(playlistTypes, operation) {
+export async function withPlaylistMutationLock(playlistTypes, operation, options = {}) {
   const types = normalizePlaylistTypes(playlistTypes);
-  return withPlaylistLocks(types, operation);
+  return withPlaylistLocks(types, operation, options);
 }
 
 export async function restartWorkerIfPending() {

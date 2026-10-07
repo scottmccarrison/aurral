@@ -861,52 +861,59 @@ const replaceSubsonicPlaylistTracks = async (user, playlist, tracks, updates = {
       }
     }
   };
-  let updated;
-  try {
-    await cancelLegacyPlaylistJobs(jobsToRemove);
-    updated = await withHonkerLock(`playlist-mutation:${playlist.id}`, async () => {
-      const replacement = flowPlaylistConfig.updateSharedPlaylist(playlist.id, {
-        ...updates,
-        tracks: canonicalTracks,
-      });
-      if (!replacement) return null;
-      for (const job of jobsToRemove) {
-        const current = downloadTracker.getJob(job.id);
-        if (!current) continue;
-        if (current.status === "done" && current.finalPath && current.managedBy === "aurral" && !current.externalPath) {
-          try {
-            const removal = await removePlaylistFileIfUnshared(current.finalPath, playlist.id, {
-              weeklyFlowRoot: playlistManager.weeklyFlowRoot,
-              excludeJobIds: legacyJobIds,
-              deleteIfUnshared: true,
-            });
-            if (removal.action !== "deleted" && removal.action !== "relocated") {
-              logger.warn("subsonic", "Retaining legacy playlist job with an unremoved file", {
-                playlistId: playlist.id,
-                jobId: current.id,
-                action: removal.action,
-              });
-              continue;
-            }
-          } catch (error) {
-            logger.warn("subsonic", "Retaining legacy playlist job after file cleanup failed", {
-              playlistId: playlist.id,
-              jobId: current.id,
-              reason: error?.message || String(error),
-            });
-            continue;
-          }
-        }
-        downloadTracker.removeJob(current.id);
-      }
-      return replacement;
-    }, {
-      ttlSeconds: 180,
-      waitTimeoutMs: 15 * 60 * 1000,
-      retryDelayMs: 250,
-    });
-  } catch (error) {
-    for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
+   let updated;
+   try {
+     await cancelLegacyPlaylistJobs(jobsToRemove);
+     updated = await withHonkerLock(`playlist-mutation:${playlist.id}`, async () => {
+       const replacement = flowPlaylistConfig.updateSharedPlaylist(playlist.id, {
+         ...updates,
+         tracks: canonicalTracks,
+       });
+       if (!replacement) return null;
+       for (const job of jobsToRemove) {
+         const current = downloadTracker.getJob(job.id);
+         if (!current) continue;
+         if (current.status === "done" && current.finalPath && current.managedBy === "aurral" && !current.externalPath) {
+           try {
+             const removal = await removePlaylistFileIfUnshared(current.finalPath, playlist.id, {
+               weeklyFlowRoot: playlistManager.weeklyFlowRoot,
+               excludeJobIds: legacyJobIds,
+               deleteIfUnshared: true,
+             });
+             if (removal.action !== "deleted" && removal.action !== "relocated") {
+               logger.warn("subsonic", "Retaining legacy playlist job with an unremoved file", {
+                 playlistId: playlist.id,
+                 jobId: current.id,
+                 action: removal.action,
+               });
+               continue;
+             }
+           } catch (error) {
+             logger.warn("subsonic", "Retaining legacy playlist job after file cleanup failed", {
+               playlistId: playlist.id,
+               jobId: current.id,
+               reason: error?.message || String(error),
+             });
+             continue;
+           }
+         }
+         downloadTracker.removeJob(current.id);
+       }
+       return replacement;
+     }, {
+       ttlSeconds: 180,
+       waitTimeoutMs: 3000,
+       retryDelayMs: 250,
+     });
+   } catch (error) {
+     // Handle lock timeout errors with 409 status
+     if (String(error?.message || "").includes("Timed out waiting for Honker lock")) {
+       const err = new Error("Another flow operation is in progress (a run may be starting or finishing) — try again in a few seconds.");
+       err.status = 409;
+       err.cause = error;
+       throw err;
+     }
+     for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
     restoreLegacyJobs();
     throw error;
   }

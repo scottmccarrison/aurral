@@ -18,6 +18,7 @@ import {
   getSharedPlaylistTrackCount,
 } from "./flowStats";
 import Tooltip from "../../components/Tooltip";
+import { describeScheduleState } from "./flowPageUtils";
 
 export function LibrarySidebarToggleIcon({ collapsed = false }) {
   return (
@@ -310,7 +311,7 @@ export function PlaylistLibraryItem({
   );
 }
 
-function FlowDetailMeta({ meta }) {
+function FlowDetailMeta({ meta, flow }) {
   if (!meta) return null;
   const parts = [];
   if (meta.username) {
@@ -319,7 +320,36 @@ function FlowDetailMeta({ meta }) {
   if (meta.trackLabel) {
     parts.push(<span key="tracks">{meta.trackLabel}</span>);
   }
-  if (meta.lastRunShort || meta.nextRunShort) {
+  
+  // Merged schedule chip for flows (combines schedule state + next run)
+  let scheduleChipRendered = false;
+  if (flow && flow.kind === "flow") {
+    const scheduleState = describeScheduleState(flow);
+    if (scheduleState) {
+      scheduleChipRendered = true;
+      // Build tooltip with full details
+      const tooltipContent = scheduleState.state === "scheduled"
+        ? `Scheduled: ${scheduleState.label}${scheduleState.nextRunShort ? ` (next in ${scheduleState.nextRunShort})` : ""}`
+        : scheduleState.label;
+      
+      // Display label + relative next-run in single chip
+      const displayLabel = scheduleState.state === "scheduled" && scheduleState.nextRunShort
+        ? `${scheduleState.label} (in ${scheduleState.nextRunShort})`
+        : scheduleState.label;
+      
+      parts.push(
+        <Tooltip key="schedule" content={tooltipContent}>
+          <span className="flow-page__detail-meta-chip">
+            <Clock className="artist-icon-xs" aria-hidden="true" />
+            {displayLabel}
+          </span>
+        </Tooltip>,
+      );
+    }
+  }
+  
+  // Only show lastRunShort/nextRunShort if schedule chip was not rendered
+  if (!scheduleChipRendered && (meta.lastRunShort || meta.nextRunShort)) {
     parts.push(
       <span key="run" className="flow-page__detail-meta-run">
         {meta.lastRunShort ? (
@@ -405,7 +435,7 @@ export function PlaylistDetailHero({
               </button>
             </Tooltip>
             {flowMeta ? (
-              <FlowDetailMeta meta={flowMeta} />
+              <FlowDetailMeta meta={flowMeta} flow={entry} />
             ) : metaLine ? (
               <p className="flow-page__detail-meta">{metaLine}</p>
             ) : null}

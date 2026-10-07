@@ -66,6 +66,39 @@ export function formatFlowLastRunShort(lastRunAt) {
   return formatDate(date, { month: "numeric", day: "numeric" });
 }
 
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+export function describeScheduleState(flow) {
+  if (!flow) return null;
+  
+  // If flow is not enabled, show "Disabled"
+  if (flow.enabled !== true) {
+    return { state: "disabled", label: "Disabled" };
+  }
+  
+  // If no nextRunAt, show "No schedule"
+  if (!flow.nextRunAt) {
+    return { state: "no-schedule", label: "No schedule" };
+  }
+  
+  // Build configured schedule string (e.g., "Sat 00:00")
+  const scheduleDays = Array.isArray(flow.scheduleDays) ? flow.scheduleDays : [];
+  const scheduleTime = String(flow.scheduleTime || "00:00").trim();
+  
+  const scheduleLabel = scheduleDays.length > 0
+    ? `${scheduleDays.map((day) => DAY_NAMES[day] || "?").join(", ")} ${scheduleTime}`
+    : scheduleTime;
+  
+  // Get relative next-run time
+  const nextRunShort = formatNextRunShort(flow.nextRunAt);
+  
+  return {
+    state: "scheduled",
+    label: scheduleLabel,
+    nextRunShort,
+  };
+}
+
 export const slugifyFilePart = (value, fallback = "flow") => {
   const slug = String(value || "")
     .trim()
