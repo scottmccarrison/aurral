@@ -227,6 +227,7 @@ function ensureRunSchema() {
     CREATE INDEX IF NOT EXISTS idx_honker_task_runs_started_at ON honker_task_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_honker_task_runs_queue_started ON honker_task_runs(queue, started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_honker_task_runs_job ON honker_task_runs(job_id, queue);
+    CREATE INDEX IF NOT EXISTS idx_honker_task_runs_name_started ON honker_task_runs(name, started_at);
   `);
   insertRunStatement = db.prepare(`
     INSERT INTO honker_task_runs (
