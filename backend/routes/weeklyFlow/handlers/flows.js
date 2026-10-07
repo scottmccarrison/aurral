@@ -184,6 +184,7 @@ export function registerFlows(router) {
       }
       const updated = await withPlaylistMutationLock(flowId, () =>
         flowPlaylistConfig.updateFlow(flowId, updates),
+        { waitTimeoutMs: 3000 },
       );
       if (!updated) {
         return res.status(404).json({ error: "Flow not found" });
@@ -200,9 +201,9 @@ export function registerFlows(router) {
           message: error.message,
         });
       }
-      res.status(500).json({
-        error: "Failed to update flow",
-        message: error.message,
+      res.status(error.status || 500).json({
+        error: error.status === 409 ? "Flow busy" : "Failed to update flow",
+        message: error.status === 409 ? error.message : undefined,
       });
     }
   });
