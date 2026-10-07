@@ -321,25 +321,35 @@ function FlowDetailMeta({ meta, flow }) {
     parts.push(<span key="tracks">{meta.trackLabel}</span>);
   }
   
-  // Add schedule state chip for flows
+  // Merged schedule chip for flows (combines schedule state + next run)
+  let scheduleChipRendered = false;
   if (flow && flow.kind === "flow") {
     const scheduleState = describeScheduleState(flow);
     if (scheduleState) {
-      const scheduleTitle = scheduleState.state === "scheduled"
-        ? `Scheduled: ${scheduleState.label}${scheduleState.nextRunShort ? ` (${scheduleState.nextRunShort})` : ""}`
+      scheduleChipRendered = true;
+      // Build tooltip with full details
+      const tooltipContent = scheduleState.state === "scheduled"
+        ? `Scheduled: ${scheduleState.label}${scheduleState.nextRunShort ? ` (next in ${scheduleState.nextRunShort})` : ""}`
         : scheduleState.label;
+      
+      // Display label + relative next-run in single chip
+      const displayLabel = scheduleState.state === "scheduled" && scheduleState.nextRunShort
+        ? `${scheduleState.label} (in ${scheduleState.nextRunShort})`
+        : scheduleState.label;
+      
       parts.push(
-        <Tooltip key="schedule" content={scheduleTitle}>
+        <Tooltip key="schedule" content={tooltipContent}>
           <span className="flow-page__detail-meta-chip">
             <Clock className="artist-icon-xs" aria-hidden="true" />
-            {scheduleState.label}
+            {displayLabel}
           </span>
         </Tooltip>,
       );
     }
   }
   
-  if (meta.lastRunShort || meta.nextRunShort) {
+  // Only show lastRunShort/nextRunShort if schedule chip was not rendered
+  if (!scheduleChipRendered && (meta.lastRunShort || meta.nextRunShort)) {
     parts.push(
       <span key="run" className="flow-page__detail-meta-run">
         {meta.lastRunShort ? (

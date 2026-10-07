@@ -85,13 +85,9 @@ export function describeScheduleState(flow) {
   const scheduleDays = Array.isArray(flow.scheduleDays) ? flow.scheduleDays : [];
   const scheduleTime = String(flow.scheduleTime || "00:00").trim();
   
-  let scheduleLabel = "";
-  if (scheduleDays.length > 0) {
-    const dayLabels = scheduleDays.map((day) => DAY_NAMES[day] || "?").join(", ");
-    scheduleLabel = `${dayLabels} ${scheduleTime}`;
-  } else {
-    scheduleLabel = scheduleTime;
-  }
+  const scheduleLabel = scheduleDays.length > 0
+    ? `${scheduleDays.map((day) => DAY_NAMES[day] || "?").join(", ")} ${scheduleTime}`
+    : scheduleTime;
   
   // Get relative next-run time
   const nextRunShort = formatNextRunShort(flow.nextRunAt);
