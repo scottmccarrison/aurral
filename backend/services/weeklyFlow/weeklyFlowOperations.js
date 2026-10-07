@@ -265,6 +265,7 @@ async function runFlowSeed({
 } = {}) {
   const safeFlowId = String(flowId || "").trim();
   if (!safeFlowId) return { missing: true };
+  // TRANSIENT: operation token superseded by newer operation; leave nextRunAt in past for hourly retry
   if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
     return { cancelled: true };
   }
@@ -277,6 +278,7 @@ async function runFlowSeed({
   }
   const flow = flowPlaylistConfig.getFlow(safeFlowId);
   if (!flow) return { missing: true };
+  // TRANSIENT: flow disabled by filter; harmless no-op (filter excludes disabled flows)
   if (requireEnabled && flow.enabled !== true) return { skipped: true };
   if (!isOwnerActive(flow.ownerUserId)) {
     // TERMINAL: owner is inactive; advance to next scheduled run
@@ -299,19 +301,23 @@ async function runFlowSeed({
     size: effectiveSize,
   });
 
-  const result = await withPlaylistMutation(safeFlowId, async () => {
-    if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
-      return { cancelled: true };
-    }
-    const latestFlow = flowPlaylistConfig.getFlow(safeFlowId);
-    if (!latestFlow) return { missing: true };
-    if (requireEnabled && latestFlow.enabled !== true) return { skipped: true };
-    if (!isOwnerActive(latestFlow.ownerUserId)) {
-      return { skipped: true, inactiveOwner: true };
-    }
-    if (JSON.stringify(latestFlow) !== flowSnapshot) {
-      throw new Error("Flow settings changed while planning; retrying");
-    }
+   const result = await withPlaylistMutation(safeFlowId, async () => {
+     if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
+       return { cancelled: true };
+     }
+     const latestFlow = flowPlaylistConfig.getFlow(safeFlowId);
+     if (!latestFlow) return { missing: true };
+     // TRANSIENT: flow disabled by filter; harmless no-op (filter excludes disabled flows)
+     if (requireEnabled && latestFlow.enabled !== true) return { skipped: true };
+     if (!isOwnerActive(latestFlow.ownerUserId)) {
+       // TERMINAL: owner is inactive; advance to next scheduled run
+       flowPlaylistConfig.scheduleNextRun(safeFlowId);
+       return { skipped: true, inactiveOwner: true };
+     }
+     if (JSON.stringify(latestFlow) !== flowSnapshot) {
+       // TRANSIENT: flow settings changed; leave nextRunAt in past for hourly retry
+       throw new Error("Flow settings changed while planning; retrying");
+     }
 
     activatePlaylistDownloadGeneration(safeFlowId);
     recordFlowGenerationStarted({ flowId: safeFlowId });
@@ -340,23 +346,24 @@ async function runFlowSeed({
     };
   }, {
     clearPending: false,
-    async beforeMutation() {
-      if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
-        return { cancelled: true };
-      }
-      const current = flowPlaylistConfig.getFlow(safeFlowId);
-      if (!current) return { missing: true };
-      if (requireEnabled && current.enabled !== true) return { skipped: true };
-      if (!isOwnerActive(current.ownerUserId)) {
-        // TERMINAL: owner is inactive; advance to next scheduled run
-        flowPlaylistConfig.scheduleNextRun(safeFlowId);
-        return { skipped: true, inactiveOwner: true };
-      }
-      if (JSON.stringify(current) !== flowSnapshot) {
-        // TRANSIENT: flow settings changed; leave nextRunAt in past for hourly retry
-        throw new Error("Flow settings changed while planning; retrying");
-      }
-      const existingFlowJobs = downloadTracker.getByPlaylistId(safeFlowId);
+     async beforeMutation() {
+       if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
+         return { cancelled: true };
+       }
+       const current = flowPlaylistConfig.getFlow(safeFlowId);
+       if (!current) return { missing: true };
+       // TRANSIENT: flow disabled by filter; harmless no-op (filter excludes disabled flows)
+       if (requireEnabled && current.enabled !== true) return { skipped: true };
+       if (!isOwnerActive(current.ownerUserId)) {
+         // TERMINAL: owner is inactive; advance to next scheduled run
+         flowPlaylistConfig.scheduleNextRun(safeFlowId);
+         return { skipped: true, inactiveOwner: true };
+       }
+       if (JSON.stringify(current) !== flowSnapshot) {
+         // TRANSIENT: flow settings changed; leave nextRunAt in past for hourly retry
+         throw new Error("Flow settings changed while planning; retrying");
+       }
+       const existingFlowJobs = downloadTracker.getByPlaylistId(safeFlowId);
       await cancelPlaylistDownloadWork(safeFlowId, existingFlowJobs, { lock: false });
       if (!isLatestWeeklyFlowOperationToken(tokenScope, token)) {
         return { cancelled: true };

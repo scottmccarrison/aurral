@@ -10,9 +10,13 @@ import {
 const [
   isolatedState,
   { db },
-  { dbOps },
+  { dbOps, userOps },
   playlistConfigModule,
   honkerTaskStatusModule,
+  operationsModule,
+  workerModule,
+  playlistSourceModule,
+  playlistManagerModule,
 ] =
   await setupIsolatedBackend(
     "flow-schedule-hardening",
@@ -20,10 +24,18 @@ const [
     "backend/db/helpers/index.js",
     "backend/services/weeklyFlow/weeklyFlowPlaylistConfig.js",
     "backend/services/honkerTaskStatus.js",
+    "backend/services/weeklyFlow/weeklyFlowOperations.js",
+    "backend/services/weeklyFlow/weeklyFlowWorker.js",
+    "backend/services/weeklyFlow/weeklyFlowPlaylistSource.js",
+    "backend/services/weeklyFlow/weeklyFlowPlaylistManager.js",
   );
 
 const { flowPlaylistConfig, invalidateFlowPlaylistConfigCache } = playlistConfigModule;
 const { recordHonkerTaskRunStarted, recordHonkerTaskRunFinished } = honkerTaskStatusModule;
+const { processWeeklyFlowOperation } = operationsModule;
+const { weeklyFlowWorker } = workerModule;
+const { playlistSource } = playlistSourceModule;
+const { playlistManager } = playlistManagerModule;
 
 test.beforeEach(() => {
   resetDatabase(db);
@@ -175,9 +187,81 @@ test("timestamp consistency: nowUnix() returns seconds, duration_ms uses seconds
   
   // Verify that when we calculate duration from seconds, we get milliseconds
   const startSeconds = nowSeconds;
-  const endSeconds = nowSeconds + 3;
-  const durationMs = (endSeconds - startSeconds) * 1000;
+   const endSeconds = nowSeconds + 3;
+   const durationMs = (endSeconds - startSeconds) * 1000;
+   
+   assert.equal(durationMs, 3000, "3 second duration should be 3000ms");
+   assert.ok(durationMs > 1000, "duration_ms should be in milliseconds, not seconds");
+});
+
+test("inactive owner exit advances nextRunAt at all three sites (pre-seed, in-mutation, beforeMutation)", async () => {
+  // Setup: create a flow with an active owner, then suspend the owner
+  dbOps.updateSettings({
+    ...dbOps.getSettings(),
+    integrations: {
+      lastfm: { apiKey: "test" },
+      slskd: { enabled: true, url: "http://slskd", apiKey: "test" },
+    },
+  });
   
-  assert.equal(durationMs, 3000, "3 second duration should be 3000ms");
-  assert.ok(durationMs > 1000, "duration_ms should be in milliseconds, not seconds");
+  const owner = userOps.createUser("inactive-owner-test", "unused", "user");
+  const flow = flowPlaylistConfig.createFlow({
+    name: "Inactive Owner Test Flow",
+    mix: { discover: 100, mix: 0, trending: 0, focus: 0 },
+    size: 1,
+    scheduleDays: [1],
+    ownerUserId: owner.id,
+  });
+  flowPlaylistConfig.setEnabled(flow.id, true);
+  
+  // Set nextRunAt to the past so we can verify it gets advanced
+  const now = Date.now();
+  const pastTime = now - 1000;
+  const settings = dbOps.getSettings();
+  const flows = [...settings.flows];
+  flows[0] = { ...flows[0], nextRunAt: pastTime };
+  dbOps.updateSettings({ ...settings, flows });
+  invalidateFlowPlaylistConfigCache();
+  
+  const flowBeforeSuspension = flowPlaylistConfig.getFlow(flow.id);
+  assert.ok(flowBeforeSuspension.nextRunAt <= now, "nextRunAt should be in the past before suspension");
+  
+  // Mock the worker methods to avoid actual flow execution
+  const originalPrepareFlowRunPlan = weeklyFlowWorker.prepareFlowRunPlan;
+  const originalSeedFlowRun = weeklyFlowWorker.seedFlowRun;
+  weeklyFlowWorker.prepareFlowRunPlan = async () => ({
+    primaryTracks: [],
+    reserveTracks: [],
+    diagnostics: { targets: { primary: 0 }, achieved: { primary: 0, reserve: 0 } },
+  });
+  weeklyFlowWorker.seedFlowRun = async () => ({
+    jobIds: [],
+    tracksQueued: 0,
+    reserveTracks: 0,
+  });
+  
+  try {
+    // Suspend the owner before the operation runs
+    userOps.updateUser(owner.id, { status: "suspended" });
+    
+    // Run the scheduled flow refresh operation
+    const result = await processWeeklyFlowOperation({
+      kind: "scheduled-flow-refresh",
+      flowId: flow.id,
+    });
+    
+    // Verify the operation returned the inactive owner skip
+    assert.deepEqual(result, { skipped: true, inactiveOwner: true });
+    
+    // Verify that nextRunAt was advanced to the future
+    const flowAfterSuspension = flowPlaylistConfig.getFlow(flow.id);
+    assert.ok(
+      flowAfterSuspension.nextRunAt > now,
+      "nextRunAt should be advanced to the future after inactive owner exit"
+    );
+  } finally {
+    weeklyFlowWorker.prepareFlowRunPlan = originalPrepareFlowRunPlan;
+    weeklyFlowWorker.seedFlowRun = originalSeedFlowRun;
+    weeklyFlowWorker.stop();
+  }
 });
