@@ -18,6 +18,7 @@ import {
   getSharedPlaylistTrackCount,
 } from "./flowStats";
 import Tooltip from "../../components/Tooltip";
+import { describeScheduleState } from "./flowPageUtils";
 
 export function LibrarySidebarToggleIcon({ collapsed = false }) {
   return (
@@ -310,7 +311,7 @@ export function PlaylistLibraryItem({
   );
 }
 
-function FlowDetailMeta({ meta }) {
+function FlowDetailMeta({ meta, flow }) {
   if (!meta) return null;
   const parts = [];
   if (meta.username) {
@@ -319,6 +320,25 @@ function FlowDetailMeta({ meta }) {
   if (meta.trackLabel) {
     parts.push(<span key="tracks">{meta.trackLabel}</span>);
   }
+  
+  // Add schedule state chip for flows
+  if (flow && flow.kind === "flow") {
+    const scheduleState = describeScheduleState(flow);
+    if (scheduleState) {
+      const scheduleTitle = scheduleState.state === "scheduled"
+        ? `Scheduled: ${scheduleState.label}${scheduleState.nextRunShort ? ` (${scheduleState.nextRunShort})` : ""}`
+        : scheduleState.label;
+      parts.push(
+        <Tooltip key="schedule" content={scheduleTitle}>
+          <span className="flow-page__detail-meta-chip">
+            <Clock className="artist-icon-xs" aria-hidden="true" />
+            {scheduleState.label}
+          </span>
+        </Tooltip>,
+      );
+    }
+  }
+  
   if (meta.lastRunShort || meta.nextRunShort) {
     parts.push(
       <span key="run" className="flow-page__detail-meta-run">
@@ -405,7 +425,7 @@ export function PlaylistDetailHero({
               </button>
             </Tooltip>
             {flowMeta ? (
-              <FlowDetailMeta meta={flowMeta} />
+              <FlowDetailMeta meta={flowMeta} flow={entry} />
             ) : metaLine ? (
               <p className="flow-page__detail-meta">{metaLine}</p>
             ) : null}

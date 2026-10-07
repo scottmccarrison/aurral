@@ -880,7 +880,10 @@ export const flowPlaylistConfig = {
     flow.scheduleDays =
       normalizedSchedule.length > 0 ? normalizedSchedule : [getDefaultScheduleDay(now)];
     flow.scheduleTime = normalizeScheduleTime(flow.scheduleTime);
-    flow.nextRunAt = computeNextRunAt(flow.scheduleDays, flow.scheduleTime, now);
+    // Only recompute nextRunAt if it's null or in the past; if already in the future, leave unchanged
+    if (flow.nextRunAt == null || flow.nextRunAt <= now) {
+      flow.nextRunAt = computeNextRunAt(flow.scheduleDays, flow.scheduleTime, now);
+    }
     flows[index] = flow;
     setFlows(flows);
     return flow;

@@ -271,14 +271,24 @@ async function runFlowSeed({
   if (!isAnyDownloadSourceConfigured()) {
     const error = new Error(getDownloadSourceNotConfiguredMessage());
     error.code = "NO_DOWNLOAD_SOURCE";
+    // TERMINAL: no download source configured; advance to next scheduled run
+    flowPlaylistConfig.scheduleNextRun(safeFlowId);
     throw error;
   }
   const flow = flowPlaylistConfig.getFlow(safeFlowId);
   if (!flow) return { missing: true };
   if (requireEnabled && flow.enabled !== true) return { skipped: true };
-  if (!isOwnerActive(flow.ownerUserId)) return { skipped: true, inactiveOwner: true };
+  if (!isOwnerActive(flow.ownerUserId)) {
+    // TERMINAL: owner is inactive; advance to next scheduled run
+    flowPlaylistConfig.scheduleNextRun(safeFlowId);
+    return { skipped: true, inactiveOwner: true };
+  }
   const unavailableError = getUnavailableFlowSourceError(flow.mix);
-  if (unavailableError) throw new Error(unavailableError);
+  if (unavailableError) {
+    // TERMINAL: unavailable source (e.g., all sources disabled); advance to next scheduled run
+    flowPlaylistConfig.scheduleNextRun(safeFlowId);
+    throw new Error(unavailableError);
+  }
 
   const effectiveSize =
     Number.isFinite(Number(size)) && Number(size) > 0
@@ -338,9 +348,12 @@ async function runFlowSeed({
       if (!current) return { missing: true };
       if (requireEnabled && current.enabled !== true) return { skipped: true };
       if (!isOwnerActive(current.ownerUserId)) {
+        // TERMINAL: owner is inactive; advance to next scheduled run
+        flowPlaylistConfig.scheduleNextRun(safeFlowId);
         return { skipped: true, inactiveOwner: true };
       }
       if (JSON.stringify(current) !== flowSnapshot) {
+        // TRANSIENT: flow settings changed; leave nextRunAt in past for hourly retry
         throw new Error("Flow settings changed while planning; retrying");
       }
       const existingFlowJobs = downloadTracker.getByPlaylistId(safeFlowId);
