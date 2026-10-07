@@ -470,6 +470,10 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_status ON playlist_download_jobs(status);
   CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_playlist_id ON playlist_download_jobs(playlist_id);
+  CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_type_created ON playlist_download_jobs(playlist_type, created_at);
+  CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_status_created ON playlist_download_jobs(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_type_status ON playlist_download_jobs(playlist_type, status);
+  CREATE INDEX IF NOT EXISTS idx_playlist_download_jobs_pending_created ON playlist_download_jobs(created_at) WHERE status = 'pending' AND upgrade_for_job_id IS NULL;
   CREATE INDEX IF NOT EXISTS idx_images_cache_cache_age ON images_cache(cache_age);
   CREATE INDEX IF NOT EXISTS idx_musicbrainz_artist_mbid_cache_updated_at ON musicbrainz_artist_mbid_cache(updated_at);
   CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
