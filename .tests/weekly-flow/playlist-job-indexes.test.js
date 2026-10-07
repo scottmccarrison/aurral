@@ -186,26 +186,53 @@ test("EXPLAIN QUERY PLAN shows index usage for pending query", () => {
     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run("job-1", "Artist A", "Song A", "playlist-1", "discover", "pending", 1000);
 
-  // Get EXPLAIN QUERY PLAN for the pending query
+  // Get EXPLAIN QUERY PLAN for the pending query (verbatim from liveNextPendingStmt/livePendingStmt)
+  const pendingQueryText = `SELECT * FROM playlist_download_jobs WHERE status = 'pending' AND upgrade_for_job_id IS NULL ORDER BY created_at, id LIMIT 1`;
   const explainResults = db
-    .prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT * FROM playlist_download_jobs WHERE status = 'pending' AND upgrade_for_job_id IS NULL ORDER BY created_at, id LIMIT 1`,
-    )
+    .prepare(`EXPLAIN QUERY PLAN ${pendingQueryText}`)
     .all();
 
   // Convert to string for inspection
   const explainText = explainResults.map((row) => row.detail).join("\n");
   console.log("EXPLAIN QUERY PLAN for pending query:\n", explainText);
 
-  // Check for index usage - look for either the partial index or USING INDEX mention
-  const usesIndex =
-    explainText.includes("idx_playlist_download_jobs_pending_created") ||
-    explainText.includes("USING INDEX") ||
-    explainText.includes("USING COVERING INDEX");
+  // Assert truthful contract: the query must use an index that serves the status filter.
+  // The planner may choose either:
+  // - idx_playlist_download_jobs_status_created (composite: status, created_at) — preferred for this query shape
+  // - idx_playlist_download_jobs_pending_created (partial: created_at WHERE status='pending' AND upgrade_for_job_id IS NULL) — fallback
+  // Both are valid; the planner prefers (status, created_at) because it covers the filter directly.
+  const usesStatusIndex =
+    explainText.includes("idx_playlist_download_jobs_status_created") ||
+    explainText.includes("idx_playlist_download_jobs_pending_created");
 
   assert.ok(
-    usesIndex,
-    `Query plan does not show index usage. Plan:\n${explainText}`,
+    usesStatusIndex && explainText.includes("USING INDEX"),
+    `Query plan must use an index serving the status filter. Expected idx_playlist_download_jobs_status_created or idx_playlist_download_jobs_pending_created with USING INDEX. Got:\n${explainText}`,
+  );
+});
+
+test("EXPLAIN QUERY PLAN shows index usage for playlist_type query", () => {
+  // Insert test data
+  db.prepare(
+    `INSERT INTO playlist_download_jobs (
+      id, artist_name, track_name, playlist_id, playlist_type, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run("job-1", "Artist A", "Song A", "playlist-1", "discover", "pending", 1000);
+
+  // Get EXPLAIN QUERY PLAN for the livePlaylistJobsStmt query shape
+  const playlistQueryText = `SELECT * FROM playlist_download_jobs WHERE playlist_type = ? ORDER BY created_at, id`;
+  const explainResults = db
+    .prepare(`EXPLAIN QUERY PLAN ${playlistQueryText}`)
+    .all("discover");
+
+  // Convert to string for inspection
+  const explainText = explainResults.map((row) => row.detail).join("\n");
+  console.log("EXPLAIN QUERY PLAN for playlist_type query:\n", explainText);
+
+  // Assert: must use idx_playlist_download_jobs_type_created for (playlist_type, created_at) ordering
+  assert.ok(
+    explainText.includes("idx_playlist_download_jobs_type_created") &&
+      explainText.includes("USING INDEX"),
+    `Query plan must use idx_playlist_download_jobs_type_created. Got:\n${explainText}`,
   );
 });
