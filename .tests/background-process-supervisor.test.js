@@ -243,3 +243,145 @@ test("only the worker with an overdue job is terminated", async () => {
     await supervisor.stop();
   }
 });
+
+test("startup grace: child that never messages is NOT killed before spawnGraceMs", async () => {
+  const children = [];
+  const killed = [];
+  const supervisor = createBackgroundProcessSupervisor({
+    groups: ["library"],
+    unresponsiveMs: 50,
+    spawnGraceMs: 100,
+    watchdogIntervalMs: 15,
+    logger: { warn() {}, error() {} },
+    forkProcess: () => {
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.send = (message) => {
+        if (message.type === "shutdown") {
+          child.exitCode = 0;
+          queueMicrotask(() => child.emit("exit", 0, null));
+        }
+      };
+      child.kill = () => { killed.push("library"); };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    supervisor.start();
+    // Wait for unresponsiveMs to pass (50ms) - should NOT kill because still in grace period (100ms)
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.deepEqual(killed, [], "should not kill during grace period");
+    // Now wait for grace to expire - wait until well past 100ms total
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(killed, ["library"], "should kill after grace expires");
+  } finally {
+    await supervisor.stop();
+  }
+});
+
+test("startup grace: child IS killed after spawnGraceMs with no message", async () => {
+  const children = [];
+  const killed = [];
+  const supervisor = createBackgroundProcessSupervisor({
+    groups: ["library"],
+    unresponsiveMs: 120000,
+    spawnGraceMs: 30,
+    watchdogIntervalMs: 10,
+    logger: { warn() {}, error() {} },
+    forkProcess: () => {
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.send = () => {};
+      child.kill = () => { killed.push("library"); };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    supervisor.start();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(killed, ["library"], "should kill after spawnGraceMs");
+  } finally {
+    await supervisor.stop();
+  }
+});
+
+test("startup grace: after first message, normal unresponsiveMs rule applies", async () => {
+  const children = [];
+  const killed = [];
+  const supervisor = createBackgroundProcessSupervisor({
+    groups: ["library"],
+    unresponsiveMs: 30,
+    spawnGraceMs: 200,
+    watchdogIntervalMs: 10,
+    logger: { warn() {}, error() {} },
+    forkProcess: () => {
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.send = () => {};
+      child.kill = () => { killed.push("library"); };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    supervisor.start();
+    // Send one message to exit grace period
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    children[0].emit("message", { type: "heartbeat", workers: [] });
+    // Now wait for unresponsiveMs (30ms) to pass
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(killed, ["library"], "should use unresponsiveMs, not spawnGraceMs");
+  } finally {
+    await supervisor.stop();
+  }
+});
+
+test("startup grace: after restart, new child gets fresh grace", async () => {
+  const children = [];
+  const killed = [];
+  const supervisor = createBackgroundProcessSupervisor({
+    groups: ["library"],
+    unresponsiveMs: 50,
+    spawnGraceMs: 100,
+    watchdogIntervalMs: 15,
+    logger: { warn() {}, error() {} },
+    forkProcess: () => {
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.send = (message) => {
+        if (message.type === "shutdown") {
+          child.exitCode = 0;
+          queueMicrotask(() => child.emit("exit", 0, null));
+        }
+      };
+      child.kill = () => {
+        killed.push("kill");
+        child.exitCode = 137;
+        queueMicrotask(() => child.emit("exit", 137, "SIGKILL"));
+      };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    supervisor.start();
+    // Wait for grace to expire on first child (100ms)
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    assert.equal(killed.length, 1, "first child should be killed after grace");
+    // Wait for restart (default 1s base delay)
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(children.length, 2, "should have forked twice (original + restart)");
+    // Second child should also get grace; reset counter and wait 70ms
+    killed.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.deepEqual(killed, [], "second child should not be killed yet in fresh grace");
+  } finally {
+    await supervisor.stop();
+  }
+});
