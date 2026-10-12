@@ -1,5 +1,6 @@
 import { ISOLATED_WORKER_GROUPS, isQueueOwnedByGroup } from "./backgroundWorkerQueues.js";
 import { logger } from "./logger.js";
+import { createLagMonitor } from "./eventLoopLagMonitor.js";
 
 const group = process.env.AURRAL_BACKGROUND_WORKER_GROUP;
 if (!ISOLATED_WORKER_GROUPS.includes(group) || !process.send) {
@@ -17,6 +18,10 @@ const flowOperationStatus = group === "flow"
   : null;
 
 let stopping = false;
+let heartbeat = null;
+let lagInterval = null;
+const LAG_CHECK_MS = 5000;
+const LAG_WARN_MS = 30000;
 const FLOW_COMMANDS = new Set([
   "start", "stop", "stopAndDrain", "wake", "researchMissingTracks",
   "retryIncompletePlaylist", "setRetryCyclePaused", "updateWorkerSettings",
@@ -167,6 +172,8 @@ async function handleFlowCommand(message) {
 async function stop() {
   if (stopping) return;
   stopping = true;
+  if (heartbeat) clearInterval(heartbeat);
+  if (lagInterval) clearInterval(lagInterval);
   await shutdownHonkerInfrastructure({ timeoutMs: 3000 });
   process.exit(0);
 }
@@ -187,7 +194,7 @@ if (group === "scheduler") {
   startWorkerSupervisor({ group });
 }
 process.send({ type: "ready", group });
-const heartbeat = setInterval(() => {
+heartbeat = setInterval(() => {
   if (process.connected) {
     const flowStatus = flowWorker
       ? { ...flowWorker.getStatus(), operationWorker: flowOperationStatus() }
@@ -202,3 +209,15 @@ const heartbeat = setInterval(() => {
   }
 }, 5000);
 heartbeat.unref?.();
+
+const lagMonitor = createLagMonitor({
+  checkMs: LAG_CHECK_MS,
+  warnMs: LAG_WARN_MS,
+  onLag: ({ lagMs }) => {
+    logger.warn("worker", "Event loop blocked", { group, lagMs });
+  },
+});
+lagInterval = setInterval(() => {
+  lagMonitor.tick();
+}, LAG_CHECK_MS);
+lagInterval.unref?.();
