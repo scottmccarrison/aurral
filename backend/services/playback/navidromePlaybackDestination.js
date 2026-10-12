@@ -234,6 +234,12 @@ export class NavidromePlaybackDestination {
     }
   }
 
+  _warnUneditablePlaylist(playlistId, title) {
+    console.warn(
+      `[NavidromePlaybackDestination] Navidrome playlist "${title}" (id ${playlistId}) is read-only/file-backed; recreating as native playlist`,
+    );
+  }
+
   async _uploadPlaylistArtwork(snapshot, playlistId) {
     if (typeof this.client?.uploadPlaylistArtwork !== "function") return;
     const { current } = this.getPlaylistNames(snapshot);
@@ -399,6 +405,9 @@ export class NavidromePlaybackDestination {
     const targetKey = this._targetKey(snapshot.ownerUserId);
     const syncKey = `${snapshot.entityId}:${targetKey}`;
     const syncHash = JSON.stringify(snapshot);
+    // Playlist IDs Navidrome rejected as read-only (file-backed imports, Subsonic
+    // error code 50). Never re-attach to these within this publish call.
+    const uneditablePlaylistIds = new Set();
     let pointer = navidromePlaylistPointerStore.getPointer(snapshot.entityId, targetKey);
     let stalePointerTitle = null;
     let stalePointerDetected = false;
@@ -465,6 +474,7 @@ export class NavidromePlaybackDestination {
           && importedSourceName
           && this._isActiveNameForOtherEntity(snapshot.entityId, importedSourceName);
         return !sourceBelongsToOtherEntity
+          && !uneditablePlaylistIds.has(playlist.id)
           && (
             importedPlaylistNames.includes(playlist.name)
             || (stalePointerDetected && recoveryNameSet.has(playlist.name))
@@ -483,9 +493,19 @@ export class NavidromePlaybackDestination {
       && pointer.title !== current
       && typeof this.client.renamePlaylist === "function"
     ) {
-      await this.client.renamePlaylist(pointer.playlistId, current);
-      pointer = { ...pointer, title: current };
-      navidromePlaylistPointerStore.setPointer(snapshot.entityId, targetKey, pointer);
+      try {
+        await this.client.renamePlaylist(pointer.playlistId, current);
+        pointer = { ...pointer, title: current };
+        navidromePlaylistPointerStore.setPointer(snapshot.entityId, targetKey, pointer);
+      } catch (error) {
+        if (Number(error?.code) !== 50) throw error;
+        // Read-only, file-backed playlist: drop the pointer and fall through to
+        // create a fresh native playlist instead of failing the publish.
+        uneditablePlaylistIds.add(pointer.playlistId);
+        this._warnUneditablePlaylist(pointer.playlistId, pointer.title || current);
+        navidromePlaylistPointerStore.deletePointer(snapshot.entityId, targetKey);
+        pointer = null;
+      }
     }
     if (typeof this.client?.invalidateIndexedSongsCache === "function") {
       this.client.invalidateIndexedSongsCache();
@@ -528,6 +548,13 @@ export class NavidromePlaybackDestination {
           playlist = { id: pointer.playlistId };
           break;
         } catch (error) {
+          if (Number(error?.code) === 50) {
+            // Read-only, file-backed playlist: drop the pointer without retrying
+            // and fall through to create a fresh native playlist.
+            uneditablePlaylistIds.add(pointer.playlistId);
+            this._warnUneditablePlaylist(pointer.playlistId, pointer.title || current);
+            break;
+          }
           if (Number(error?.code) !== 70) throw error;
         }
       }
@@ -539,11 +566,20 @@ export class NavidromePlaybackDestination {
       const playlists = await this._fetchPlaylists();
       if (importedPlaylistNames.length) playlist = playlists.find((candidate) =>
         importedPlaylistNames.includes(candidate.name)
+        && !uneditablePlaylistIds.has(candidate.id)
         && !navidromePlaylistPointerStore.hasPlaylistId(candidate.id),
       );
       if (playlist) {
-        await this.client.updatePlaylist(playlist.id, { name: current, songIds });
-      } else {
+        try {
+          await this.client.updatePlaylist(playlist.id, { name: current, songIds });
+        } catch (error) {
+          if (Number(error?.code) !== 50) throw error;
+          uneditablePlaylistIds.add(playlist.id);
+          this._warnUneditablePlaylist(playlist.id, playlist.name);
+          playlist = null;
+        }
+      }
+      if (!playlist) {
         playlist = await this.client.createPlaylist(current, songIds);
         artworkNeedsUpload = true;
       }

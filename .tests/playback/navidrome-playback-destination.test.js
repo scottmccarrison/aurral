@@ -102,6 +102,21 @@ function rejectMissingPlaylist(client, playlistId) {
   };
 }
 
+function rejectUneditablePlaylist(client, playlistId) {
+  const updatePlaylist = client.updatePlaylist.bind(client);
+  const state = { attempts: 0 };
+  client.updatePlaylist = async (id, payload) => {
+    if (id === playlistId) {
+      state.attempts += 1;
+      const error = new Error("User is not authorized for the given operation");
+      error.code = 50;
+      throw error;
+    }
+    return updatePlaylist(id, payload);
+  };
+  return state;
+}
+
 test.beforeEach(async () => {
   await resetDatabase(db);
   await fs.rm(weeklyFlowRoot, { recursive: true, force: true });
@@ -711,6 +726,142 @@ test("keeps a stored pointer when playlist lookup fails for another reason", asy
     "saved-id",
   );
   assert.deepEqual(client.calls.created, []);
+});
+
+test("recreates a native playlist when the pointer targets a read-only playlist", async () => {
+  const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "ReadOnly Pointer" });
+  const client = createClient({
+    playlists: [{
+      id: "file-backed-id",
+      name: "ReadOnly Pointer",
+      comment: "Auto-imported from 'ReadOnly Pointer.m3u'",
+    }],
+    songs: { Song: { id: "song-1" } },
+  });
+  const uneditable = rejectUneditablePlaylist(client, "file-backed-id");
+  navidromePlaylistPointerStore.setPointer(playlist.id, "global", {
+    playlistId: "file-backed-id",
+    title: playlist.name,
+  });
+  const destination = new NavidromePlaybackDestination(weeklyFlowRoot, { client });
+
+  assert.deepEqual(
+    await destination.publishPlaylist(
+      createPlaybackPlaylistSnapshot({
+        entityId: playlist.id,
+        displayName: playlist.name,
+        tracks: [{ path: "/music/song.flac", title: "Song", artist: "Artist" }],
+      }),
+    ),
+    { ok: true },
+  );
+
+  assert.deepEqual(client.calls.created, [
+    { name: "ReadOnly Pointer", songIds: ["song-1"] },
+  ]);
+  assert.equal(uneditable.attempts, 1);
+  assert.deepEqual(client.calls.updated, []);
+  assert.equal(
+    navidromePlaylistPointerStore.getPointer(playlist.id, "global").playlistId,
+    "created",
+  );
+});
+
+test("creates a native playlist when renaming a read-only pointer target fails", async () => {
+  const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "Renamed ReadOnly" });
+  const client = createClient({
+    playlists: [{
+      id: "file-backed-id",
+      name: "Old ReadOnly Title",
+      comment: "Auto-imported from 'Old ReadOnly Title.m3u'",
+    }],
+    songs: { Song: { id: "song-1" } },
+  });
+  const uneditable = rejectUneditablePlaylist(client, "file-backed-id");
+  const renamePlaylist = client.renamePlaylist.bind(client);
+  let renameAttempts = 0;
+  client.renamePlaylist = async (id, name) => {
+    if (id === "file-backed-id") {
+      renameAttempts += 1;
+      const error = new Error("User is not authorized for the given operation");
+      error.code = 50;
+      throw error;
+    }
+    return renamePlaylist(id, name);
+  };
+  navidromePlaylistPointerStore.setPointer(playlist.id, "global", {
+    playlistId: "file-backed-id",
+    title: "Old ReadOnly Title",
+  });
+  const destination = new NavidromePlaybackDestination(weeklyFlowRoot, { client });
+
+  assert.deepEqual(
+    await destination.publishPlaylist(
+      createPlaybackPlaylistSnapshot({
+        entityId: playlist.id,
+        displayName: playlist.name,
+        tracks: [{ path: "/music/song.flac", title: "Song", artist: "Artist" }],
+      }),
+    ),
+    { ok: true },
+  );
+
+  assert.deepEqual(client.calls.created, [
+    { name: "Renamed ReadOnly", songIds: ["song-1"] },
+  ]);
+  assert.equal(renameAttempts, 1);
+  assert.equal(uneditable.attempts, 0);
+  assert.deepEqual(client.calls.updated, []);
+  assert.deepEqual(client.calls.renamed, []);
+  const recoveredPointer = navidromePlaylistPointerStore.getPointer(playlist.id, "global");
+  assert.equal(recoveredPointer.playlistId, "created");
+  assert.equal(recoveredPointer.title, "Renamed ReadOnly");
+});
+
+test("creates a native playlist when a name-matched playlist is read-only", async () => {
+  const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "ReadOnly Fallback" });
+  const client = createClient({
+    playlists: [{
+      id: "file-backed-id",
+      name: "ReadOnly Fallback",
+      comment: "Auto-imported from 'ReadOnly Fallback.m3u'",
+    }],
+    songs: { Song: { id: "song-1" } },
+  });
+  const uneditable = rejectUneditablePlaylist(client, "file-backed-id");
+  const getPlaylists = client.getPlaylists.bind(client);
+  let listingAttempts = 0;
+  client.getPlaylists = async () => {
+    listingAttempts += 1;
+    // Fail the first listing so the pointer-less recovery finder cannot adopt the
+    // read-only playlist; the fall-through name match must handle the code 50.
+    if (listingAttempts === 1) throw new Error("Navidrome is temporarily unavailable");
+    return getPlaylists();
+  };
+  const destination = new NavidromePlaybackDestination(weeklyFlowRoot, { client });
+  await fs.mkdir(destination.libraryRoot, { recursive: true });
+  await fs.writeFile(path.join(destination.libraryRoot, "ReadOnly Fallback.m3u"), "legacy");
+
+  assert.deepEqual(
+    await destination.publishPlaylist(
+      createPlaybackPlaylistSnapshot({
+        entityId: playlist.id,
+        displayName: playlist.name,
+        tracks: [{ path: "/music/song.flac", title: "Song", artist: "Artist" }],
+      }),
+    ),
+    { ok: true },
+  );
+
+  assert.deepEqual(client.calls.created, [
+    { name: "ReadOnly Fallback", songIds: ["song-1"] },
+  ]);
+  assert.equal(uneditable.attempts, 1);
+  assert.deepEqual(client.calls.updated, []);
+  assert.equal(
+    navidromePlaylistPointerStore.getPointer(playlist.id, "global").playlistId,
+    "created",
+  );
 });
 
 test("replaces a pointer whose imported source belongs to another entity", async () => {
