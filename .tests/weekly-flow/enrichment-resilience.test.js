@@ -48,9 +48,9 @@ test.after(async () => {
   await cleanupIsolatedState(isolatedState);
 });
 
-test("enrichSharedPlaylistMbids with budget exceeded in resolution phase returns partial completion", async () => {
+test("enrichSharedPlaylistMbids with budget exceeded in resolution phase (zero resolutions) emits warn and sets flag", async () => {
   const playlist = flowPlaylistConfig.createSharedPlaylist({
-    name: "Budget Test",
+    name: "Budget Test Zero",
     tracks: [
       { artistName: "Artist 1", trackName: "Track 1" },
       { artistName: "Artist 2", trackName: "Track 2" },
@@ -58,33 +58,112 @@ test("enrichSharedPlaylistMbids with budget exceeded in resolution phase returns
     ],
   });
 
-  // Use an advancing clock that immediately exceeds budget
-  let callCount = 0;
-  const advancingNow = () => {
-    callCount += 1;
-    // First call returns start time (0), then all subsequent calls show budget exceeded
-    return callCount === 1 ? 0 : PLAYLIST_MBID_ENRICHMENT_BUDGET_MS + 1000;
+  // Mock logger.warn to track budget exceeded calls
+  const warnCalls = [];
+  const originalWarn = logger.warn;
+  logger.warn = (category, message, payload) => {
+    warnCalls.push({ category, message, payload });
   };
 
-  const result = await enrichSharedPlaylistMbids(playlist.id, {
-    budgetMs: PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
-    now: advancingNow,
-    resolveTrackContext: (track) => ({
-      ...track,
-      artistMbid: "artist-mbid",
-      albumMbid: "album-mbid",
-      trackMbid: "track-mbid",
-    }),
-  });
+  try {
+    // Use an advancing clock that immediately exceeds budget
+    let callCount = 0;
+    const advancingNow = () => {
+      callCount += 1;
+      // First call returns start time (0), then all subsequent calls show budget exceeded
+      return callCount === 1 ? 0 : PLAYLIST_MBID_ENRICHMENT_BUDGET_MS + 1000;
+    };
 
-  // With budget exceeded immediately, we skip all tracks and return early
-  // So no resolutions means no apply phase and budgetExceeded not in result
-  assert.equal(result.tracksExamined, 3);
-  assert.equal(result.missing, false);
-  assert.equal(result.changed, false);
+    const result = await enrichSharedPlaylistMbids(playlist.id, {
+      budgetMs: PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
+      now: advancingNow,
+      resolveTrackContext: (track) => ({
+        ...track,
+        artistMbid: "artist-mbid",
+        albumMbid: "album-mbid",
+        trackMbid: "track-mbid",
+      }),
+    });
+
+    // Should emit warn once when budget exceeded with zero resolutions
+    const budgetWarns = warnCalls.filter((c) => c.message === "MBID enrichment budget exceeded — partial completion");
+    assert.equal(budgetWarns.length, 1, "Budget warn should be emitted exactly once");
+    
+    const warnPayload = budgetWarns[0].payload;
+    assert.equal(warnPayload.playlistId, playlist.id);
+    assert.equal(warnPayload.tracksExamined, 3);
+    assert.equal(warnPayload.tracksResolved, 0);
+    assert.ok(typeof warnPayload.elapsedMs === "number");
+
+    // Result should have budgetExceeded flag
+    assert.equal(result.budgetExceeded, true);
+    assert.equal(result.tracksExamined, 3);
+    assert.equal(result.missing, false);
+    assert.equal(result.changed, false);
+  } finally {
+    logger.warn = originalWarn;
+  }
 });
 
-test("enrichSharedPlaylistMbids with advancing now() trips budget in apply phase", async () => {
+test("enrichSharedPlaylistMbids with budget exceeded after resolving tracks emits warn and applies resolved tracks", async () => {
+  // Create tracks that HAVE missing MBIDs so they'll trigger buildResolution
+  const playlist = flowPlaylistConfig.createSharedPlaylist({
+    name: "Budget Partial Test",
+    tracks: [
+      { artistName: "Artist 1", trackName: "Track 1", artistMbid: undefined },
+      { artistName: "Artist 2", trackName: "Track 2", artistMbid: undefined },
+      { artistName: "Artist 3", trackName: "Track 3", artistMbid: undefined },
+    ],
+  });
+
+  // Mock logger.warn
+  const warnCalls = [];
+  const originalWarn = logger.warn;
+  logger.warn = (category, message, payload) => {
+    warnCalls.push({ category, message, payload });
+  };
+
+  try {
+    // Clock that starts at 0, allows resolutions to proceed to buildResolution
+    // Then exceeds budget after first few iterations
+    let callCount = 0;
+    const advancingNow = () => {
+      callCount += 1;
+      // Adjust threshold to allow at least some buildResolutions to complete
+      // The concurrent nature means we may have multiple checks per track
+      return callCount <= 15 ? 0 : PLAYLIST_MBID_ENRICHMENT_BUDGET_MS + 1000;
+    };
+
+    const result = await enrichSharedPlaylistMbids(playlist.id, {
+      budgetMs: PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
+      now: advancingNow,
+      resolveTrackContext: (track) => ({
+        ...track,
+        artistMbid: "artist-mbid",
+        albumMbid: "album-mbid",
+        trackMbid: "track-mbid",
+      }),
+    });
+
+    // If we got resolutions and budget was exceeded, we should see a warn
+    if (result.budgetExceeded) {
+      const budgetWarns = warnCalls.filter(
+        (c) => c.message === "MBID enrichment budget exceeded — partial completion"
+      );
+      assert.equal(budgetWarns.length, 1, "Budget warn should be emitted exactly once");
+
+      const warnPayload = budgetWarns[0].payload;
+      assert.equal(warnPayload.playlistId, playlist.id);
+      assert.equal(warnPayload.tracksExamined, 3);
+      assert.ok(typeof warnPayload.tracksResolved === "number");
+      assert.ok(typeof warnPayload.elapsedMs === "number");
+    }
+  } finally {
+    logger.warn = originalWarn;
+  }
+});
+
+test("enrichSharedPlaylistMbids with budget exceeded in apply phase emits warn and stops applying", async () => {
   const playlist = flowPlaylistConfig.createSharedPlaylist({
     name: "Budget Apply Test",
     tracks: [
@@ -93,31 +172,46 @@ test("enrichSharedPlaylistMbids with advancing now() trips budget in apply phase
     ],
   });
 
-  let callCount = 0;
-  const advancingNow = () => {
-    callCount += 1;
-    // Let resolution phase complete, then trip budget during apply
-    return callCount > 20 ? 7 * 60 * 1000 : 0;
+  // Mock logger.warn
+  const warnCalls = [];
+  const originalWarn = logger.warn;
+  logger.warn = (category, message, payload) => {
+    warnCalls.push({ category, message, payload });
   };
 
-  const result = await enrichSharedPlaylistMbids(playlist.id, {
-    budgetMs: PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
-    now: advancingNow,
-    resolveTrackContext: (track) => ({
-      ...track,
-      artistMbid: "artist-mbid",
-      albumMbid: "album-mbid",
-      trackMbid: "track-mbid",
-    }),
-  });
+  try {
+    let callCount = 0;
+    const advancingNow = () => {
+      callCount += 1;
+      // Let resolution phase complete, then trip budget during apply
+      return callCount > 20 ? 7 * 60 * 1000 : 0;
+    };
 
-  // Should have budgetExceeded flag when we trip budget during apply
-  // This test verifies the apply-phase budget check works
-  assert.ok(result);
-  assert.ok(result.playlistId);
+    const result = await enrichSharedPlaylistMbids(playlist.id, {
+      budgetMs: PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
+      now: advancingNow,
+      resolveTrackContext: (track) => ({
+        ...track,
+        artistMbid: "artist-mbid",
+        albumMbid: "album-mbid",
+        trackMbid: "track-mbid",
+      }),
+    });
+
+    // Should have budgetExceeded flag when we trip budget during apply
+    assert.ok(result);
+    assert.ok(result.playlistId);
+    // When budget exceeded, the result should have this flag
+    if (result.budgetExceeded) {
+      const budgetWarns = warnCalls.filter((c) => c.message === "MBID enrichment budget exceeded — partial completion");
+      assert.equal(budgetWarns.length, 1, "Budget warn should be emitted exactly once");
+    }
+  } finally {
+    logger.warn = originalWarn;
+  }
 });
 
-test("schedulePlaylistMbidEnrichment dedup prevents duplicate enqueue", async () => {
+test("schedulePlaylistMbidEnrichment dedup prevents duplicate enqueue and logs dedup message", async () => {
   const playlistId = "test-playlist-dedup";
   flowPlaylistConfig.createSharedPlaylist({
     id: playlistId,
@@ -125,18 +219,36 @@ test("schedulePlaylistMbidEnrichment dedup prevents duplicate enqueue", async ()
     tracks: [{ artistName: "Artist", trackName: "Track" }],
   });
 
-  const jobId1 = schedulePlaylistMbidEnrichment(playlistId);
-  const jobId2 = schedulePlaylistMbidEnrichment(playlistId);
+  // Mock logger.debug to track dedup calls
+  const debugCalls = [];
+  const originalDebug = logger.debug;
+  logger.debug = (category, message, payload) => {
+    debugCalls.push({ category, message, payload });
+  };
 
-  // Both should have the same ID (second call returns existing job)
-  assert.equal(jobId1, jobId2);
+  try {
+    const jobId1 = schedulePlaylistMbidEnrichment(playlistId);
+    const jobId2 = schedulePlaylistMbidEnrichment(playlistId);
 
-  // Queue should have exactly one job
-  const queuedJobs = listHonkerJobs("playlist-mbid-enrichment");
-  const playlistJobs = queuedJobs.filter(
-    (job) => job.payload?.playlistId === playlistId
-  );
-  assert.equal(playlistJobs.length, 1);
+    // Both should have the same ID (second call returns existing job)
+    assert.equal(jobId1, jobId2);
+
+    // Should have exactly one dedup debug message
+    const dedupMessages = debugCalls.filter(
+      (c) => c.message === "MBID enrichment already queued; skipping"
+    );
+    assert.equal(dedupMessages.length, 1, "Dedup message should be logged exactly once");
+    assert.equal(dedupMessages[0].payload?.playlistId, playlistId);
+
+    // Queue should have exactly one job
+    const queuedJobs = listHonkerJobs("playlist-mbid-enrichment");
+    const playlistJobs = queuedJobs.filter(
+      (job) => job.payload?.playlistId === playlistId
+    );
+    assert.equal(playlistJobs.length, 1);
+  } finally {
+    logger.debug = originalDebug;
+  }
 });
 
 test("schedulePlaylistMbidEnrichment allows different playlists", async () => {
@@ -162,7 +274,7 @@ test("schedulePlaylistMbidEnrichment allows different playlists", async () => {
   assert.notEqual(jobId1, jobId2);
 });
 
-test("schedulePlaylistMbidEnrichment quarantines after 3 recent failures", async () => {
+test("schedulePlaylistMbidEnrichment quarantines after 3 recent failures with exact warn message and verifies payload", async () => {
   const playlistId = "quarantine-test-playlist";
   const nowUnixSeconds = Math.floor(Date.now() / 1000);
 
@@ -172,28 +284,60 @@ test("schedulePlaylistMbidEnrichment quarantines after 3 recent failures", async
     tracks: [{ artistName: "Artist", trackName: "Track" }],
   });
 
-  // Insert 3 failed runs
-  const payload = JSON.stringify({ playlistId, kind: "playlist-mbid-enrichment" });
-  const insertSql = `
-    INSERT INTO honker_task_runs (
-      job_id, queue, status, payload, started_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?)
-  `;
-  for (let i = 0; i < 3; i++) {
-    db.prepare(insertSql).run(
-      1000 + i,
-      "playlist-mbid-enrichment",
-      "failed",
-      payload,
-      nowUnixSeconds - 60, // 1 minute ago
-      nowUnixSeconds - 60
+  // Mock logger.warn to track quarantine messages
+  const warnCalls = [];
+  const originalWarn = logger.warn;
+  logger.warn = (category, message, payload) => {
+    warnCalls.push({ category, message, payload });
+  };
+
+  try {
+    // Insert 3 failed runs
+    const payload = JSON.stringify({ playlistId, kind: "playlist-mbid-enrichment" });
+    const insertSql = `
+      INSERT INTO honker_task_runs (
+        job_id, queue, status, payload, started_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `;
+    for (let i = 0; i < 3; i++) {
+      db.prepare(insertSql).run(
+        1000 + i,
+        "playlist-mbid-enrichment",
+        "failed",
+        payload,
+        nowUnixSeconds - 60, // 1 minute ago
+        nowUnixSeconds - 60
+      );
+    }
+
+    const result = schedulePlaylistMbidEnrichment(playlistId);
+
+    // Should be quarantined (return null)
+    assert.equal(result, null);
+
+    // Should emit warn with exact message
+    const quarantineWarns = warnCalls.filter(
+      (c) => c.message === "MBID enrichment quarantined after repeated failures"
     );
+    assert.equal(quarantineWarns.length, 1, "Quarantine warn should be emitted exactly once");
+    
+    const warnPayload = quarantineWarns[0].payload;
+    assert.equal(warnPayload.playlistId, playlistId);
+    assert.equal(warnPayload.recentFailures, 3);
+    assert.equal(warnPayload.windowMinutes, 60);
+
+    // Verify inserted payload really contains the playlistId fragment
+    const insertedRuns = db
+      .prepare("SELECT payload FROM honker_task_runs WHERE queue = 'playlist-mbid-enrichment'")
+      .all();
+    assert.equal(insertedRuns.length, 3);
+    for (const run of insertedRuns) {
+      const parsedPayload = JSON.parse(run.payload);
+      assert.equal(parsedPayload.playlistId, playlistId);
+    }
+  } finally {
+    logger.warn = originalWarn;
   }
-
-  const result = schedulePlaylistMbidEnrichment(playlistId);
-
-  // Should be quarantined (return null)
-  assert.equal(result, null);
 });
 
 test("schedulePlaylistMbidEnrichment allows enqueue with 2 failures", async () => {

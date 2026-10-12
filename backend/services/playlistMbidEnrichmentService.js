@@ -317,6 +317,15 @@ export async function enrichSharedPlaylistMbids(
     }
   }
 
+  const elapsedMs = now() - startMs;
+  if (budgetExceeded) {
+    logger.warn(
+      "enrichment",
+      "MBID enrichment budget exceeded — partial completion",
+      { playlistId: safePlaylistId, tracksExamined, tracksResolved, elapsedMs },
+    );
+  }
+
   if (resolutions.length === 0) {
     return {
       missing: false,
@@ -326,16 +335,8 @@ export async function enrichSharedPlaylistMbids(
       tracksResolved,
       playlistTracksUpdated: 0,
       jobsUpdated: 0,
+      budgetExceeded,
     };
-  }
-
-  const elapsedMs = now() - startMs;
-  if (budgetExceeded) {
-    logger.warn(
-      "enrichment",
-      "MBID enrichment budget exceeded — partial completion",
-      { playlistId: safePlaylistId, tracksExamined, tracksResolved, elapsedMs },
-    );
   }
 
   return withHonkerLock(
