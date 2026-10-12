@@ -51,6 +51,7 @@ export function createBackgroundProcessSupervisor({
 
   function launch(group) {
     if (stopping || children.has(group)) return;
+    hasMessaged.delete(group);
     let child;
     try {
       child = forkProcess(ENTRY, [], {

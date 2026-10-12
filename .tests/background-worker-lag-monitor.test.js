@@ -112,3 +112,43 @@ test("lag monitor: multiple lags emit multiple warns", () => {
   monitor.tick();
   assert.equal(warnCalls.length, 2);
 });
+
+test("lag monitor: errors in onLag callback are swallowed and do not propagate", () => {
+  const now = () => currentTime;
+  let currentTime = 1000;
+  let throwingCallCount = 0;
+  
+  const monitor = createLagMonitor({
+    checkMs: 5000,
+    warnMs: 30000,
+    now,
+    onLag: ({ lagMs }) => {
+      throwingCallCount += 1;
+      throw new Error("Callback error should be swallowed");
+    },
+  });
+
+  // First tick
+  currentTime = 1000;
+  monitor.tick();
+
+  // Second tick with lag that exceeds threshold
+  currentTime = 37000; // 31s late
+  
+  // This should not throw; error should be swallowed
+  assert.doesNotThrow(() => {
+    monitor.tick();
+  });
+
+  // Verify the callback was attempted (to confirm onLag was called)
+  assert.equal(throwingCallCount, 1, "onLag should be called once");
+  
+  // Third tick should work normally (expectedAt was reset despite error)
+  currentTime = 42000;
+  throwingCallCount = 0;
+  assert.doesNotThrow(() => {
+    monitor.tick();
+  });
+  // Even with no lag, tick should complete without issues
+  assert.equal(throwingCallCount, 0, "no lag on tick 3, so onLag not called");
+});

@@ -250,8 +250,8 @@ test("startup grace: child that never messages is NOT killed before spawnGraceMs
   const supervisor = createBackgroundProcessSupervisor({
     groups: ["library"],
     unresponsiveMs: 50,
-    spawnGraceMs: 100,
-    watchdogIntervalMs: 15,
+    spawnGraceMs: 300,
+    watchdogIntervalMs: 20,
     logger: { warn() {}, error() {} },
     forkProcess: () => {
       const child = new EventEmitter();
@@ -270,11 +270,11 @@ test("startup grace: child that never messages is NOT killed before spawnGraceMs
   });
   try {
     supervisor.start();
-    // Wait for unresponsiveMs to pass (50ms) - should NOT kill because still in grace period (100ms)
-    await new Promise((resolve) => setTimeout(resolve, 70));
+    // Wait for unresponsiveMs to pass (50ms) - should NOT kill because still in grace period (300ms)
+    await new Promise((resolve) => setTimeout(resolve, 120));
     assert.deepEqual(killed, [], "should not kill during grace period");
-    // Now wait for grace to expire - wait until well past 100ms total
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Now wait for grace to expire - wait until well past 300ms total
+    await new Promise((resolve) => setTimeout(resolve, 250));
     assert.deepEqual(killed, ["library"], "should kill after grace expires");
   } finally {
     await supervisor.stop();
@@ -287,8 +287,8 @@ test("startup grace: child IS killed after spawnGraceMs with no message", async 
   const supervisor = createBackgroundProcessSupervisor({
     groups: ["library"],
     unresponsiveMs: 120000,
-    spawnGraceMs: 30,
-    watchdogIntervalMs: 10,
+    spawnGraceMs: 150,
+    watchdogIntervalMs: 20,
     logger: { warn() {}, error() {} },
     forkProcess: () => {
       const child = new EventEmitter();
@@ -302,7 +302,7 @@ test("startup grace: child IS killed after spawnGraceMs with no message", async 
   });
   try {
     supervisor.start();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 230));
     assert.deepEqual(killed, ["library"], "should kill after spawnGraceMs");
   } finally {
     await supervisor.stop();
@@ -314,9 +314,9 @@ test("startup grace: after first message, normal unresponsiveMs rule applies", a
   const killed = [];
   const supervisor = createBackgroundProcessSupervisor({
     groups: ["library"],
-    unresponsiveMs: 30,
-    spawnGraceMs: 200,
-    watchdogIntervalMs: 10,
+    unresponsiveMs: 100,
+    spawnGraceMs: 300,
+    watchdogIntervalMs: 20,
     logger: { warn() {}, error() {} },
     forkProcess: () => {
       const child = new EventEmitter();
@@ -330,27 +330,96 @@ test("startup grace: after first message, normal unresponsiveMs rule applies", a
   });
   try {
     supervisor.start();
-    // Send one message to exit grace period
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    // Send one message to exit grace period (within first 50ms of startup)
+    await new Promise((resolve) => setTimeout(resolve, 30));
     children[0].emit("message", { type: "heartbeat", workers: [] });
-    // Now wait for unresponsiveMs (30ms) to pass
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Now wait for unresponsiveMs (100ms) to pass from the message timestamp
+    await new Promise((resolve) => setTimeout(resolve, 180));
     assert.deepEqual(killed, ["library"], "should use unresponsiveMs, not spawnGraceMs");
   } finally {
     await supervisor.stop();
   }
 });
 
-test("startup grace: after restart, new child gets fresh grace", async () => {
+test("startup grace: after restart, new child gets fresh grace and is killed after grace from second spawn", async () => {
   const children = [];
   const killed = [];
+  const spawnTimes = [];
   const supervisor = createBackgroundProcessSupervisor({
     groups: ["library"],
     unresponsiveMs: 50,
-    spawnGraceMs: 100,
-    watchdogIntervalMs: 15,
+    spawnGraceMs: 300,
+    watchdogIntervalMs: 20,
     logger: { warn() {}, error() {} },
     forkProcess: () => {
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.signalCode = null;
+      spawnTimes.push(Date.now());
+      child.send = (message) => {
+        if (message.type === "shutdown") {
+          child.exitCode = 0;
+          queueMicrotask(() => child.emit("exit", 0, null));
+        }
+      };
+      child.kill = () => {
+        killed.push("kill");
+        child.exitCode = 137;
+        queueMicrotask(() => child.emit("exit", 137, "SIGKILL"));
+      };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    supervisor.start();
+    const firstSpawnTime = spawnTimes[0];
+    
+    // Wait for grace to expire on first child (300ms)
+    await new Promise((resolve) => setTimeout(resolve, 380));
+    assert.equal(killed.length, 1, "first child should be killed after grace");
+    
+    // Wait for restart (default 1s base delay)
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(children.length, 2, "should have forked twice (original + restart)");
+    const secondSpawnTime = spawnTimes[1];
+    
+    // Second child should also get grace; verify timing from second spawn
+    killed.length = 0;
+    
+    // Wait 100ms from second spawn (still in grace, should not kill)
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.deepEqual(killed, [], "second child should not be killed yet in fresh grace");
+    
+    // Wait until well past grace from second spawn (~300ms)
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(killed, ["kill"], "should kill after grace expires from second spawn");
+    
+    // Verify second kill happened ~300ms after second spawn
+    const killTime = spawnTimes[1] + 300;
+    assert.ok(Date.now() >= killTime, "kill should occur after grace from second spawn");
+  } finally {
+    await supervisor.stop();
+  }
+});
+
+test("startup grace: fresh grace resets on fork failure + restart", async () => {
+  const children = [];
+  const killed = [];
+  let forkAttempt = 0;
+  const supervisor = createBackgroundProcessSupervisor({
+    groups: ["library"],
+    unresponsiveMs: 50,
+    spawnGraceMs: 300,
+    watchdogIntervalMs: 20,
+    logger: { warn() {}, error() {} },
+    forkProcess: () => {
+      forkAttempt += 1;
+      if (forkAttempt === 1) {
+        // First fork: throw to simulate failure
+        throw new Error("First fork failed");
+      }
+      // Second fork succeeds: never-messaged child gets fresh grace
       const child = new EventEmitter();
       child.exitCode = null;
       child.signalCode = null;
@@ -371,16 +440,17 @@ test("startup grace: after restart, new child gets fresh grace", async () => {
   });
   try {
     supervisor.start();
-    // Wait for grace to expire on first child (100ms)
-    await new Promise((resolve) => setTimeout(resolve, 130));
-    assert.equal(killed.length, 1, "first child should be killed after grace");
-    // Wait for restart (default 1s base delay)
+    // First fork fails, wait for restart delay (base 1s)
     await new Promise((resolve) => setTimeout(resolve, 1100));
-    assert.equal(children.length, 2, "should have forked twice (original + restart)");
-    // Second child should also get grace; reset counter and wait 70ms
-    killed.length = 0;
-    await new Promise((resolve) => setTimeout(resolve, 70));
-    assert.deepEqual(killed, [], "second child should not be killed yet in fresh grace");
+    assert.equal(children.length, 1, "should have spawned after first fork failure");
+    
+    // Wait 100ms (still in grace, should not kill)
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(killed, [], "should not kill fresh child in grace");
+    
+    // Wait until well past grace (300ms from spawn)
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(killed, ["kill"], "should kill after grace expires from second spawn");
   } finally {
     await supervisor.stop();
   }

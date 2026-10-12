@@ -180,11 +180,20 @@ export function schedulePlaylistMbidEnrichment(
   if (!safePlaylistId) return null;
 
   // 1. Dedup: check if an active job already exists
-  const activeJob = findActiveHonkerJob(
-    "playlist-mbid-enrichment",
-    (payload) => payload?.playlistId === safePlaylistId,
-    { recoverExpired: true },
-  );
+  let activeJob = null;
+  try {
+    activeJob = findActiveHonkerJob(
+      "playlist-mbid-enrichment",
+      (payload) => payload?.playlistId === safePlaylistId,
+      { recoverExpired: true },
+    );
+  } catch (err) {
+    logger.warn(
+      "enrichment",
+      "MBID enrichment guard check failed; enqueueing anyway",
+      { playlistId: safePlaylistId, check: "dedup", error: err?.message },
+    );
+  }
   if (activeJob) {
     logger.debug("enrichment", "MBID enrichment already queued; skipping", { playlistId: safePlaylistId });
     return activeJob.id || null;
@@ -217,8 +226,13 @@ export function schedulePlaylistMbidEnrichment(
         // poison failures recur every ~14min so 3 strikes always fit inside retention)
         return null;
       }
-    } catch {
+    } catch (err) {
       // If query fails, continue with enqueue
+      logger.warn(
+        "enrichment",
+        "MBID enrichment guard check failed; enqueueing anyway",
+        { playlistId: safePlaylistId, check: "quarantine", error: err?.message },
+      );
     }
   }
 

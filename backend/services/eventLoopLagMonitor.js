@@ -8,10 +8,14 @@ export function createLagMonitor({ checkMs, warnMs, now = () => Date.now(), onLa
 
   return {
     tick() {
-      const current = now();
-      const lagMs = current - expectedAt;
-      if (lagMs > warnMs) {
-        onLag({ lagMs });
+      try {
+        const current = now();
+        const lagMs = current - expectedAt;
+        if (lagMs > warnMs) {
+          onLag({ lagMs });
+        }
+      } catch (error) {
+        // Swallow errors in lag monitor callback to prevent uncaughtException
       }
       // Always reset to prevent drift accrual
       expectedAt = now() + checkMs;
