@@ -493,9 +493,19 @@ export class NavidromePlaybackDestination {
       && pointer.title !== current
       && typeof this.client.renamePlaylist === "function"
     ) {
-      await this.client.renamePlaylist(pointer.playlistId, current);
-      pointer = { ...pointer, title: current };
-      navidromePlaylistPointerStore.setPointer(snapshot.entityId, targetKey, pointer);
+      try {
+        await this.client.renamePlaylist(pointer.playlistId, current);
+        pointer = { ...pointer, title: current };
+        navidromePlaylistPointerStore.setPointer(snapshot.entityId, targetKey, pointer);
+      } catch (error) {
+        if (Number(error?.code) !== 50) throw error;
+        // Read-only, file-backed playlist: drop the pointer and fall through to
+        // create a fresh native playlist instead of failing the publish.
+        uneditablePlaylistIds.add(pointer.playlistId);
+        this._warnUneditablePlaylist(pointer.playlistId, pointer.title || current);
+        navidromePlaylistPointerStore.deletePointer(snapshot.entityId, targetKey);
+        pointer = null;
+      }
     }
     if (typeof this.client?.invalidateIndexedSongsCache === "function") {
       this.client.invalidateIndexedSongsCache();

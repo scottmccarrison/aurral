@@ -767,6 +767,57 @@ test("recreates a native playlist when the pointer targets a read-only playlist"
   );
 });
 
+test("creates a native playlist when renaming a read-only pointer target fails", async () => {
+  const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "Renamed ReadOnly" });
+  const client = createClient({
+    playlists: [{
+      id: "file-backed-id",
+      name: "Old ReadOnly Title",
+      comment: "Auto-imported from 'Old ReadOnly Title.m3u'",
+    }],
+    songs: { Song: { id: "song-1" } },
+  });
+  const uneditable = rejectUneditablePlaylist(client, "file-backed-id");
+  const renamePlaylist = client.renamePlaylist.bind(client);
+  let renameAttempts = 0;
+  client.renamePlaylist = async (id, name) => {
+    if (id === "file-backed-id") {
+      renameAttempts += 1;
+      const error = new Error("User is not authorized for the given operation");
+      error.code = 50;
+      throw error;
+    }
+    return renamePlaylist(id, name);
+  };
+  navidromePlaylistPointerStore.setPointer(playlist.id, "global", {
+    playlistId: "file-backed-id",
+    title: "Old ReadOnly Title",
+  });
+  const destination = new NavidromePlaybackDestination(weeklyFlowRoot, { client });
+
+  assert.deepEqual(
+    await destination.publishPlaylist(
+      createPlaybackPlaylistSnapshot({
+        entityId: playlist.id,
+        displayName: playlist.name,
+        tracks: [{ path: "/music/song.flac", title: "Song", artist: "Artist" }],
+      }),
+    ),
+    { ok: true },
+  );
+
+  assert.deepEqual(client.calls.created, [
+    { name: "Renamed ReadOnly", songIds: ["song-1"] },
+  ]);
+  assert.equal(renameAttempts, 1);
+  assert.equal(uneditable.attempts, 0);
+  assert.deepEqual(client.calls.updated, []);
+  assert.deepEqual(client.calls.renamed, []);
+  const recoveredPointer = navidromePlaylistPointerStore.getPointer(playlist.id, "global");
+  assert.equal(recoveredPointer.playlistId, "created");
+  assert.equal(recoveredPointer.title, "Renamed ReadOnly");
+});
+
 test("creates a native playlist when a name-matched playlist is read-only", async () => {
   const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "ReadOnly Fallback" });
   const client = createClient({
