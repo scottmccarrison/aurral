@@ -32,11 +32,13 @@ export function createBackgroundProcessSupervisor({
   jobTimeoutsMs = JOB_TIMEOUT_MS,
   unresponsiveMs = UNRESPONSIVE_MS,
   watchdogIntervalMs = 15000,
+  spawnGraceMs = 10 * 60 * 1000,
 } = {}) {
   const children = new Map();
   const restartTimers = new Map();
   const attempts = new Map();
   const lastSeen = new Map();
+  const hasMessaged = new Set();
   const workerStatuses = new Map();
   const activeJobs = new Map();
   const exitReasons = new Map();
@@ -49,6 +51,7 @@ export function createBackgroundProcessSupervisor({
 
   function launch(group) {
     if (stopping || children.has(group)) return;
+    hasMessaged.delete(group);
     let child;
     try {
       child = forkProcess(ENTRY, [], {
@@ -66,6 +69,9 @@ export function createBackgroundProcessSupervisor({
     lastSeen.set(group, Date.now());
     const startedAt = Date.now();
     child.on("message", (message) => {
+      if (!hasMessaged.has(group)) {
+        hasMessaged.add(group);
+      }
       lastSeen.set(group, Date.now());
       if (message?.type === "heartbeat" && Array.isArray(message.workers)) {
         workerStatuses.set(group, message.workers);
@@ -104,6 +110,7 @@ export function createBackgroundProcessSupervisor({
       exited = true;
       if (children.get(group) === child) children.delete(group);
       lastSeen.delete(group);
+      hasMessaged.delete(group);
       workerStatuses.delete(group);
       activeJobs.delete(group);
       flowStatuses.delete(group);
@@ -147,7 +154,11 @@ export function createBackgroundProcessSupervisor({
     for (const group of groups) launch(group);
     watchdogInterval = setInterval(() => {
       for (const [group, child] of children) {
-        const unresponsive = Date.now() - (lastSeen.get(group) || 0) > unresponsiveMs;
+        // Use spawnGraceMs if this group has never messaged; otherwise use unresponsiveMs.
+        // A worker that never messages will restart-loop at the grace cadence (accepted tradeoff;
+        // attempts reset after 60s of life means no backoff escalation).
+        const timeout = hasMessaged.has(group) ? unresponsiveMs : spawnGraceMs;
+        const unresponsive = Date.now() - (lastSeen.get(group) || 0) > timeout;
         const job = [...(activeJobs.get(group)?.values() || [])].find((entry) => {
           const limit = jobTimeoutsMs[entry.queue] || jobTimeoutsMs[group];
           return limit && Date.now() - entry.startedAt > limit;
@@ -205,6 +216,7 @@ export function createBackgroundProcessSupervisor({
     }));
     await Promise.all(pending);
     children.clear();
+    hasMessaged.clear();
     workerStatuses.clear();
     activeJobs.clear();
     exitReasons.clear();

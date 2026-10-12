@@ -1,6 +1,7 @@
 import {
   enqueuePlaylistMbidEnrichmentJob,
   withHonkerLock,
+  findActiveHonkerJob,
 } from "./honkerDb.js";
 import { downloadTracker } from "./weeklyFlow/weeklyFlowDownloadTracker.js";
 import { playlistManager } from "./weeklyFlow/weeklyFlowPlaylistManager.js";
@@ -12,10 +13,13 @@ import {
   tracksShareMembership,
 } from "./weeklyFlow/weeklyFlowPlaylistConfig.js";
 import { dbOps } from "../db/helpers/index.js";
+import { db } from "../config/db-sqlite.js";
+import { logger } from "./logger.js";
 
 const PLAYLIST_MBID_ENRICHMENT_DELAY_SECONDS = 20;
 const ARTIST_MBID_RECONCILIATION_KEY = "playlistArtistMbidReconciliationVersion";
 const ARTIST_MBID_RECONCILIATION_VERSION = 1;
+export const PLAYLIST_MBID_ENRICHMENT_BUDGET_MS = 6 * 60 * 1000;
 
 function hasValue(value) {
   return String(value || "").trim() !== "";
@@ -126,6 +130,7 @@ function matchingJobsForTrack(track, jobs) {
 }
 
 async function buildResolution(track, jobs, resolveTrackContext, reconcileArtistMbids = false) {
+  await new Promise((resolve) => setImmediate(resolve));
   const shouldResolve =
     isMissingMbid(track) ||
     (reconcileArtistMbids && hasValue(track?.albumMbid)) ||
@@ -173,6 +178,64 @@ export function schedulePlaylistMbidEnrichment(
 ) {
   const safePlaylistId = String(playlistId || "").trim();
   if (!safePlaylistId) return null;
+
+  // 1. Dedup: check if an active job already exists
+  let activeJob = null;
+  try {
+    activeJob = findActiveHonkerJob(
+      "playlist-mbid-enrichment",
+      (payload) => payload?.playlistId === safePlaylistId,
+      { recoverExpired: true },
+    );
+  } catch (err) {
+    logger.warn(
+      "enrichment",
+      "MBID enrichment guard check failed; enqueueing anyway",
+      { playlistId: safePlaylistId, check: "dedup", error: err?.message },
+    );
+  }
+  if (activeJob) {
+    logger.debug("enrichment", "MBID enrichment already queued; skipping", { playlistId: safePlaylistId });
+    return activeJob.id || null;
+  }
+
+  // 2. Durable quarantine: check recent failures
+  const uuidRegex = /^[A-Za-z0-9_-]+$/;
+  if (uuidRegex.test(safePlaylistId)) {
+    const nowUnixSeconds = Math.floor(Date.now() / 1000);
+    const oneHourAgoUnixSeconds = nowUnixSeconds - 3600;
+    const escapedPlaylistIdJsonFragment = `"playlistId":"${safePlaylistId}"`;
+    try {
+      const result = db
+        .prepare(
+          `SELECT COUNT(*) as count FROM honker_task_runs
+         WHERE queue = 'playlist-mbid-enrichment'
+         AND status = 'failed'
+         AND started_at > ?
+         AND payload LIKE ?`,
+        )
+        .get(oneHourAgoUnixSeconds, `%${escapedPlaylistIdJsonFragment}%`);
+      const recentFailures = result?.count || 0;
+      if (recentFailures >= 3) {
+        logger.warn(
+          "enrichment",
+          "MBID enrichment quarantined after repeated failures",
+          { playlistId: safePlaylistId, recentFailures, windowMinutes: 60 },
+        );
+        // Self-heals: failures age out of the 1h window (honker_task_runs prunes at ~65min retention;
+        // poison failures recur every ~14min so 3 strikes always fit inside retention)
+        return null;
+      }
+    } catch (err) {
+      // If query fails, continue with enqueue
+      logger.warn(
+        "enrichment",
+        "MBID enrichment guard check failed; enqueueing anyway",
+        { playlistId: safePlaylistId, check: "quarantine", error: err?.message },
+      );
+    }
+  }
+
   return enqueuePlaylistMbidEnrichmentJob(
     {
       kind: "playlist-mbid-enrichment",
@@ -231,6 +294,8 @@ export async function enrichSharedPlaylistMbids(
   {
     resolveTrackContext = resolveWeeklyFlowTrackContext,
     reconcileArtistMbids = false,
+    budgetMs = PLAYLIST_MBID_ENRICHMENT_BUDGET_MS,
+    now = Date.now,
   } = {},
 ) {
   const safePlaylistId = String(playlistId || "").trim();
@@ -243,19 +308,36 @@ export async function enrichSharedPlaylistMbids(
   const snapshotTracks = Array.isArray(snapshotPlaylist.tracks) ? snapshotPlaylist.tracks : [];
   const tracksExamined = snapshotTracks.length;
   let tracksResolved = 0;
+  let budgetExceeded = false;
 
+  const startMs = now();
   const resolver =
     typeof resolveTrackContext === "function"
       ? resolveTrackContext
       : resolveWeeklyFlowTrackContext;
-  const rawResolutions = await mapWithConcurrency(snapshotTracks, 4, (track) =>
-    buildResolution(track, snapshotJobs, resolver, reconcileArtistMbids === true),
-  );
+
+  // Resolution phase with budget check
+  const rawResolutions = await mapWithConcurrency(snapshotTracks, 4, async (track) => {
+    if (now() - startMs > budgetMs) {
+      budgetExceeded = true;
+      return null;
+    }
+    return buildResolution(track, snapshotJobs, resolver, reconcileArtistMbids === true);
+  });
   const resolutions = rawResolutions.filter(Boolean);
   for (const resolution of resolutions) {
     if (!isMissingMbid(resolution.resolvedTrack)) {
       tracksResolved += 1;
     }
+  }
+
+  const elapsedMs = now() - startMs;
+  if (budgetExceeded) {
+    logger.warn(
+      "enrichment",
+      "MBID enrichment budget exceeded — partial completion",
+      { playlistId: safePlaylistId, tracksExamined, tracksResolved, elapsedMs },
+    );
   }
 
   if (resolutions.length === 0) {
@@ -267,6 +349,7 @@ export async function enrichSharedPlaylistMbids(
       tracksResolved,
       playlistTracksUpdated: 0,
       jobsUpdated: 0,
+      budgetExceeded,
     };
   }
 
@@ -274,7 +357,7 @@ export async function enrichSharedPlaylistMbids(
     `playlist-mutation:${safePlaylistId}`,
     async () => {
       const currentPlaylist = flowPlaylistConfig.getSharedPlaylist(safePlaylistId);
-      if (!currentPlaylist) return { missing: true, changed: false };
+      if (!currentPlaylist) return { missing: true, changed: false, budgetExceeded };
 
       const currentTracks = Array.isArray(currentPlaylist.tracks) ? currentPlaylist.tracks : [];
       const usedResolutionIndexes = new Set();
@@ -300,7 +383,15 @@ export async function enrichSharedPlaylistMbids(
       const jobs = downloadTracker.getByPlaylistType(safePlaylistId);
       let jobsUpdated = 0;
       const updatedJobIds = new Set();
+      let iterationCount = 0;
       for (const track of nextTracks) {
+        iterationCount += 1;
+        if (iterationCount % 25 === 0) {
+          await new Promise((resolve) => setImmediate(resolve));
+          if (now() - startMs > budgetMs) {
+            break; // Stop applying further tracks if budget exceeded
+          }
+        }
         const resolution = resolutions.find(
           (entry) =>
             tracksShareMembership(track, entry.originalTrack) ||
@@ -334,6 +425,7 @@ export async function enrichSharedPlaylistMbids(
         tracksResolved,
         playlistTracksUpdated,
         jobsUpdated,
+        budgetExceeded,
       };
     },
     {
