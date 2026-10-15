@@ -358,7 +358,9 @@ async function handleUsenetDownload(payload, helpers) {
     // "Item already exists" under no_dupes). Duplicate-class rejections are
     // expected churn when a re-add slips past the queue pre-check above, so
     // log quietly and follow the same path as an in-queue duplicate hit.
-    if (/duplicate|exists/i.test(message)) {
+    // Match "already exists" rather than bare "exists" so unrelated failures
+    // ("Download path exists but is not writable") keep warning.
+    if (/duplicate|already exists/i.test(message)) {
       logger.debug("slskd", "Usenet client rejected duplicate release", {
         jobId: job.id,
         client: clientKey,

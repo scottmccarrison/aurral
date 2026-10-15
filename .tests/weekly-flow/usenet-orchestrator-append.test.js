@@ -262,3 +262,28 @@ test("non-duplicate append rejection without a reason fails the source with the 
   assert.equal(result.failed, true);
   assert.deepEqual(failMessages, ["SABnzbd rejected the NZB URL"]);
 });
+
+test("append errors containing bare 'exists' are not duplicate-class and still warn", async (t) => {
+  const { result, failMessages, warnings, debugs } = await runDownloadPhase(t, {
+    queueSlots: [],
+    appendImpl: () => {
+      throw new Error(
+        "SABnzbd rejected the NZB URL: Download path exists but is not writable",
+      );
+    },
+    titles: ["The Lumineers - Brightside (2022) FLAC"],
+  });
+
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].arguments[1], "Usenet client append failed for release");
+  assert.equal(
+    debugs.some(
+      (call) => call.arguments[1] === "Usenet client rejected duplicate release",
+    ),
+    false,
+  );
+  assert.equal(result.failed, true);
+  assert.deepEqual(failMessages, [
+    "SABnzbd rejected the NZB URL: Download path exists but is not writable",
+  ]);
+});
