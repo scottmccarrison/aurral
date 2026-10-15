@@ -91,6 +91,38 @@ function readQueueStatus(item) {
   return String(item?.Status || item?.status || "").toUpperCase();
 }
 
+// SABnzbd sanitizes job names (punctuation stripped/replaced, sometimes leading
+// words dropped), so raw queue filenames rarely match release titles exactly:
+// observed queue filename "Lumineers.-.Brightside.2022" for a release titled
+// "The Lumineers - Brightside (2022) FLAC". Compare alphanumeric-only forms and
+// treat as duplicate on equality or when either side's 40-character normalized
+// window appears in the other. The minimum window length keeps short, generic
+// names ("2022", "flac") from matching every slot. Accepted trade-off: two
+// releases sharing the first 40 normalized characters (e.g. multi-disc editions
+// with very long common prefixes) can collide; SABnzbd's own no_dupes policy
+// treats such near-identical names as duplicates too.
+const QUEUE_DUP_WINDOW_LENGTH = 40;
+const QUEUE_DUP_MIN_WINDOW_LENGTH = 12;
+
+function normalizeQueueCompareName(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+export function isUsenetQueueNameDuplicate(slotFilename, releaseTitle) {
+  const slotName = normalizeQueueCompareName(slotFilename);
+  const titleName = normalizeQueueCompareName(releaseTitle);
+  if (!slotName || !titleName) return false;
+  if (slotName === titleName) return true;
+  const slotWindow = slotName.slice(0, QUEUE_DUP_WINDOW_LENGTH);
+  const titleWindow = titleName.slice(0, QUEUE_DUP_WINDOW_LENGTH);
+  return (
+    (slotWindow.length >= QUEUE_DUP_MIN_WINDOW_LENGTH &&
+      titleName.includes(slotWindow)) ||
+    (titleWindow.length >= QUEUE_DUP_MIN_WINDOW_LENGTH &&
+      slotName.includes(titleWindow))
+  );
+}
+
 async function findAudioFilesRecursive(root, depth = 0, matches = []) {
   if (depth > 7) return matches;
   let entries = [];
@@ -288,11 +320,9 @@ async function handleUsenetDownload(payload, helpers) {
     try {
       const queueResult = await client.api("queue");
       const queueSlots = queueResult?.queue?.slots || [];
-      const releaseTitleLower = String(release.title || "").trim().toLowerCase();
-      const isDuplicate = queueSlots.some((slot) => {
-        const slotName = String(slot?.filename || "").trim().toLowerCase();
-        return slotName === releaseTitleLower || slotName.startsWith(releaseTitleLower.slice(0, 40));
-      });
+      const isDuplicate = queueSlots.some((slot) =>
+        isUsenetQueueNameDuplicate(slot?.filename, release.title),
+      );
       if (isDuplicate) {
         logger.debug("usenet", "Skipping duplicate NZB already in queue", {
           jobId: job.id,
@@ -324,12 +354,27 @@ async function handleUsenetDownload(payload, helpers) {
     });
   } catch (error) {
     const message = error?.message || String(error);
-    logger.warn("slskd", "Usenet client append failed for release", {
-      jobId: job.id,
-      client: clientKey,
-      releaseTitle: release.title,
-      error: message,
-    });
+    // SABnzbd surfaces its own rejection reason in the error message (e.g.
+    // "Item already exists" under no_dupes). Duplicate-class rejections are
+    // expected churn when a re-add slips past the queue pre-check above, so
+    // log quietly and follow the same path as an in-queue duplicate hit.
+    // Match "already exists" rather than bare "exists" so unrelated failures
+    // ("Download path exists but is not writable") keep warning.
+    if (/duplicate|already exists/i.test(message)) {
+      logger.debug("slskd", "Usenet client rejected duplicate release", {
+        jobId: job.id,
+        client: clientKey,
+        releaseTitle: release.title,
+        error: message,
+      });
+    } else {
+      logger.warn("slskd", "Usenet client append failed for release", {
+        jobId: job.id,
+        client: clientKey,
+        releaseTitle: release.title,
+        error: message,
+      });
+    }
     if (hasNextCandidate(payload)) return buildNextCandidatePayload(payload, { nzbId: null, history: null });
     return helpers.failOrTryNextSource(payload, job, message);
   }

@@ -344,6 +344,63 @@ test("SABnzbd client does not claim a failed queue or history deletion succeeded
   assert.equal(await client.deleteHistoryItem("SABnzbd_nzo_history"), false);
 });
 
+test("SABnzbd client surfaces the addurl rejection reason", async () => {
+  const client = new SabnzbdClient();
+  client.api = async () => ({ status: false, error: "Item already exists" });
+
+  await assert.rejects(
+    client.appendUrl({
+      name: "Artist - Album (2024) FLAC",
+      url: "https://indexer.test/download/1",
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "SABnzbd rejected the NZB URL: Item already exists",
+      );
+      return true;
+    },
+  );
+});
+
+test("SABnzbd client keeps the plain rejection message when addurl gives no reason", async () => {
+  const client = new SabnzbdClient();
+  client.api = async () => ({ status: true, nzo_ids: [] });
+
+  await assert.rejects(
+    client.appendUrl({
+      name: "Artist - Album (2024) FLAC",
+      url: "https://indexer.test/download/1",
+    }),
+    (error) => {
+      assert.equal(error.message, "SABnzbd rejected the NZB URL");
+      return true;
+    },
+  );
+});
+
+test("SABnzbd client collapses whitespace and truncates a messy rejection reason", async () => {
+  const client = new SabnzbdClient();
+  // Newlines/tabs plus filler well past the 200-character cap.
+  const messyReason = ["Item", "already", "exists", ...Array(60).fill("noise")].join("\r\n\t");
+  client.api = async () => ({ status: false, error: messyReason });
+
+  await assert.rejects(
+    client.appendUrl({
+      name: "Artist - Album (2024) FLAC",
+      url: "https://indexer.test/download/1",
+    }),
+    (error) => {
+      const prefix = "SABnzbd rejected the NZB URL: ";
+      assert.ok(error.message.startsWith(`${prefix}Item already exists noise`));
+      assert.equal(/[\r\n\t]/.test(error.message), false);
+      // Reason is capped at exactly 200 characters.
+      assert.equal(error.message.length, prefix.length + 200);
+      return true;
+    },
+  );
+});
+
 test("download source selection orders enabled sources by priority", () => {
   dbOps.updateSettings({
     integrations: {
