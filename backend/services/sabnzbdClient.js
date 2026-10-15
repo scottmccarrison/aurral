@@ -172,7 +172,11 @@ export class SabnzbdClient {
       pp: 3,
     });
     if (!result?.nzo_ids || result.nzo_ids.length === 0) {
-      throw new Error("SABnzbd rejected the NZB URL");
+      // Surface SABnzbd's own reason (e.g. duplicate rejection under no_dupes)
+      // so callers can classify the failure; keep the historic message prefix.
+      throw new Error(
+        `SABnzbd rejected the NZB URL${result?.error ? `: ${String(result.error)}` : ""}`,
+      );
     }
     return {
       nzbId: String(result.nzo_ids[0]),

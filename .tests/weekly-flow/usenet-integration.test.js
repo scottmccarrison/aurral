@@ -344,6 +344,41 @@ test("SABnzbd client does not claim a failed queue or history deletion succeeded
   assert.equal(await client.deleteHistoryItem("SABnzbd_nzo_history"), false);
 });
 
+test("SABnzbd client surfaces the addurl rejection reason", async () => {
+  const client = new SabnzbdClient();
+  client.api = async () => ({ status: false, error: "Item already exists" });
+
+  await assert.rejects(
+    client.appendUrl({
+      name: "Artist - Album (2024) FLAC",
+      url: "https://indexer.test/download/1",
+    }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "SABnzbd rejected the NZB URL: Item already exists",
+      );
+      return true;
+    },
+  );
+});
+
+test("SABnzbd client keeps the plain rejection message when addurl gives no reason", async () => {
+  const client = new SabnzbdClient();
+  client.api = async () => ({ status: true, nzo_ids: [] });
+
+  await assert.rejects(
+    client.appendUrl({
+      name: "Artist - Album (2024) FLAC",
+      url: "https://indexer.test/download/1",
+    }),
+    (error) => {
+      assert.equal(error.message, "SABnzbd rejected the NZB URL");
+      return true;
+    },
+  );
+});
+
 test("download source selection orders enabled sources by priority", () => {
   dbOps.updateSettings({
     integrations: {
